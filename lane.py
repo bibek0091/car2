@@ -438,18 +438,21 @@ class HybridLaneTracker:
             return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
 
         if has_right and has_left:
-            # Exactly in the middle when both lines are visible
-            base_x = (ev(sl) + ev(sr)) / 2.0 + center_bias
-            anchor = "RL_DUAL"
+            # Center of road when both lanes visible
+            center = (ev(sl) + ev(sr)) / 2.0
+            # ensure center still respects right lane priority
+            right_limit = ev(sr) - 40
+            base_x = min(center, right_limit)
+            anchor = "CENTER_BOTH"
         elif has_right:
-            # Keep an extra offset to the left from the right edge to avoid touching it
-            # 'hw' is half lane width. Subtracting right_offset pushes the target securely leftward.
+            # Right lane priority
+            # Maintain safe divider distance
             base_x = ev(sr) - hw - right_offset
-            anchor = "RL_FROM_EDGE"
-        else:
-            # Only left line is visible. Project target to the middle of the lane.
-            base_x = ev(sl) + hw + left_offset
-            anchor = "RL_FROM_DIVIDER"
+            anchor = "RIGHT_PRIORITY"
+        elif has_left:
+            # fallback when right lane missing
+            base_x = ev(sl) + hw
+            anchor = "LEFT_FALLBACK"
 
         self.dead_reckoner.last_valid_target    = base_x
         self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
@@ -596,7 +599,7 @@ class VisionPipeline:
         )
         if not hasattr(self, "_target_ema"):
             self._target_ema = target_x
-        self._target_ema = 0.8 * self._target_ema + 0.2 * target_x
+        self._target_ema = 0.5 * self._target_ema + 0.5 * target_x
         target_x = self._target_ema
         
         if target_x is None:
@@ -658,6 +661,8 @@ class StanleyController:
                 lane_width_px: float, map_curvature: float = 0.0):
         ppm  = max(lane_width_px, 50) / 0.35
         ce_m = (320.0 - target_x_px) / ppm
+        # amplify lateral error so steering reacts faster
+        ce_m *= 2.5
 
         k_eff = self.k * min(1.0, velocity_ms / 0.25)
         reactive_rad = heading_rad + math.atan2(k_eff * ce_m, velocity_ms + self.ks)
@@ -708,12 +713,12 @@ class DividerGuard:
 
 class Controller:
     MAX_STEER      = 45.0
-    MAX_STEER_RATE = 25.0
+    MAX_STEER_RATE = 40.0
 
     def __init__(self):
         self.prev_steer = 0.0
         self.guard      = DividerGuard()
-        self.stanley    = StanleyController(k=1.8, ks=0.2, wheelbase_m=0.23)
+        self.stanley    = StanleyController(k=3.2, ks=0.15, wheelbase_m=0.23)
 
     def compute(self, perc_res, nav_state: str = "NORMAL", velocity_ms: float = 0.0,
                 dt: float = 0.033, traffic_mult: float = 1.0,
