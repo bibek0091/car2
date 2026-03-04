@@ -119,7 +119,7 @@ class HybridLaneTracker:
     MIN_PIX_OK       = 200
     EMA_ALPHA        = 0.65   # F-12: base alpha (was 0.50 — too slow)
     EMA_ALPHA_TURN   = 0.85   # F-12: fast alpha when curvature is high
-    STALE_FIT_FRAMES = 12     # F-07: was 5 (167 ms) — now 12 (400 ms)
+    STALE_FIT_FRAMES = 5      # 167ms — brief occlusion ok, long ghost fit is dangerous
 
     # ── Right-lane driving constants ──────────────────────────────────────────
     # In BFMC (drives on the right):
@@ -268,15 +268,21 @@ class HybridLaneTracker:
                     base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
                     anchor = "RL_DUAL"
             else:
-                # hw may be stale from a wide-road segment. Use SINGLE_LANE_PX
-                # as the safe estimate when only the outer edge is visible.
+                # sr visible, sl not. Use fixed half-lane width (not stale EMA).
                 single_hw = self.SINGLE_LANE_PX / 2.0   # 200 / 2 = 100 px
                 base_x = ev(sr) - single_hw + self.RIGHT_LANE_BIAS_PX
+                # Graduated blend toward image centre when sr is stale.
+                # Prevents a frozen polynomial from jerking target on clearance.
+                if self.right_stale > 1:
+                    blend = min(1.0, self.right_stale / float(self.STALE_FIT_FRAMES))
+                    base_x = base_x * (1.0 - blend) + 320.0 * blend
                 anchor = "RL_FROM_EDGE"
         # ─ TIER 2: divider follow ────────────────────────────────────
         else:
-            # sr gone — shadow the centre divider from the right at a fixed offset
-            base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
+            # sr gone — shadow the centre divider from the right at a fixed offset.
+            # Floor clamp: never place target left of 290px (image near-centre).
+            # sl moves on curves; without clamp, target chases sl leftward.
+            base_x = max(ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX, 290.0)
             anchor = "DIVIDER_FOLLOW"
 
         self.dead_reckoner.last_valid_target    = base_x

@@ -1287,9 +1287,6 @@ class Orchestrator:
                             self._nav_state = f"JUNCTION_{action}"
                         else: self._nav_state="JUNCTION_STRAIGHT"
 
-                    imu_yaw = imu.get_yaw()
-                    self.localizer.update_imu_yaw(imu_yaw)
-
                     self.localizer.update(
                         velocity_ms=velocity_ms, dt=dt,
                         camera_heading_rad=perc.heading_rad,
@@ -1300,6 +1297,12 @@ class Orchestrator:
                         optical_vel=perc.optical_vel,
                         current_steer_rad=math.radians(getattr(self._last_ctrl,'steer_angle_deg',0.0)))
                     self._path_cursor = self.localizer.path_cursor
+
+                    # IMU correction runs AFTER dead-reckoning, not before.
+                    # This way IMU corrects the result of all layers, not just
+                    # the opening state that Layers 1-4 then override.
+                    imu_yaw = imu.get_yaw()
+                    self.localizer.update_imu_yaw(imu_yaw)
 
                     self.localizer.get_upcoming_curve_from_path(
                         self._planned_path,self._path_cursor,velocity_ms)

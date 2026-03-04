@@ -68,7 +68,13 @@ class BNO055_IMU:
         if self._sim_mode:
             return self._sim_yaw + self._yaw_offset
         heading, _, _ = self.read_orientation()
-        return math.radians(heading) + self._yaw_offset
+        # BNO055 NDOF heading: 0 = North, increases CLOCKWISE, degrees.
+        # World map yaw:        0 = East,  increases CCW,       radians.
+        # Conversion: world_yaw = π/2 − radians(heading)
+        # Proof: heading=0(N) → π/2(N in world ✓), heading=90(E) → 0(E in world ✓)
+        world_yaw = math.pi / 2.0 - math.radians(heading)
+        world_yaw = (world_yaw + math.pi) % (2 * math.pi) - math.pi
+        return world_yaw + self._yaw_offset
 
     def update_sim_yaw(self, delta_rad: float):
         """Called from pilot loop in sim mode to integrate steering-based yaw."""

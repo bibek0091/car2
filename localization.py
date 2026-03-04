@@ -381,18 +381,15 @@ class LocalizationEngine:
                 alpha = 0.30 if abs(raw_yaw_rate) > 0.3 else 0.12
                 self._cam_yaw_smoothed = (alpha * raw_yaw_rate
                                           + (1.0 - alpha) * self._cam_yaw_smoothed)
-                self.visual_yaw_rate = self._cam_yaw_smoothed
-
+                # Integrate bounded angular rate (LOC-A)
                 yaw_delta = float(np.clip(
-                    self._cam_yaw_smoothed * dt,
+                    -self._cam_yaw_smoothed * dt,   # NEGATED: cam frame is CW, world is CCW
                     -self._MAX_CAM_YAW_CORRECTION,
                      self._MAX_CAM_YAW_CORRECTION))
                 self.yaw += yaw_delta
-                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
-                # LOC-C: absolute lane-tangent soft correction (drift preventer)
-                # camera_heading_rad is RELATIVE (see PROMPT 2) — apply as delta
-                abs_corr = float(np.clip(camera_heading_rad * self._ABS_HEADING_GAIN,
+                # Soft absolute correction for drift (LOC-C)
+                abs_corr = float(np.clip(-camera_heading_rad * self._ABS_HEADING_GAIN,  # NEGATED
                                          -self._ABS_HEADING_MAX_CORR,
                                           self._ABS_HEADING_MAX_CORR))
                 self.yaw += abs_corr
