@@ -35,6 +35,22 @@ C_AMBER = ( 50, 190, 255)
 C_RED   = ( 50,  50, 230)
 C_WHITE = (230, 230, 230)
 
+# ── GUI TUNER ─────────────────────────────────────────────────────
+
+class LaneTuner:
+    def __init__(self):
+        cv2.namedWindow("Lane Tuner", cv2.WINDOW_NORMAL)
+        cv2.createTrackbar("Right Divider Offset", "Lane Tuner", 40, 120, lambda x: None)
+        cv2.createTrackbar("Left Divider Offset",  "Lane Tuner",  0, 120, lambda x: None)
+        cv2.createTrackbar("Center Bias",          "Lane Tuner",  0,  80, lambda x: None)
+
+    def read(self):
+        right_offset = cv2.getTrackbarPos("Right Divider Offset", "Lane Tuner")
+        left_offset  = cv2.getTrackbarPos("Left Divider Offset",  "Lane Tuner")
+        center_bias  = cv2.getTrackbarPos("Center Bias",          "Lane Tuner")
+        return right_offset, left_offset, center_bias
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # HARDWARE I/O (From hardware_io.py)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -407,7 +423,8 @@ class HybridLaneTracker:
         return self.sl, self.sr, dbg, mode_label
 
     def get_target_x(self, y_eval, lane_width_px, extra_offset_px=0,
-                     nav_state="NORMAL", frames_lost=0, last_speed=0.0, last_steering=0.0):
+                     nav_state="NORMAL", frames_lost=0, last_speed=0.0, last_steering=0.0,
+                     right_offset=40, left_offset=0, center_bias=0):
         sl, sr = self.sl, self.sr
         hw = lane_width_px / 2.0
 
@@ -422,16 +439,16 @@ class HybridLaneTracker:
 
         if has_right and has_left:
             # Exactly in the middle when both lines are visible
-            base_x = (ev(sl) + ev(sr)) / 2.0
+            base_x = (ev(sl) + ev(sr)) / 2.0 + center_bias
             anchor = "RL_DUAL"
         elif has_right:
             # Keep an extra offset to the left from the right edge to avoid touching it
-            # 'hw' is half lane width. Subtracting an extra 40px pushes the target securely leftward.
-            base_x = ev(sr) - hw - 40
+            # 'hw' is half lane width. Subtracting right_offset pushes the target securely leftward.
+            base_x = ev(sr) - hw - right_offset
             anchor = "RL_FROM_EDGE"
         else:
             # Only left line is visible. Project target to the middle of the lane.
-            base_x = ev(sl) + hw
+            base_x = ev(sl) + hw + left_offset
             anchor = "RL_FROM_DIVIDER"
 
         self.dead_reckoner.last_valid_target    = base_x
@@ -535,7 +552,8 @@ class VisionPipeline:
 
     def process(self, raw_frame, dt: float = 0.033, extra_offset_px=0.0,
                 nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
-                upcoming_curve: str = "STRAIGHT", pitch_rad: float = 0.0) -> PerceptionResult:
+                upcoming_curve: str = "STRAIGHT", pitch_rad: float = 0.0,
+                right_offset: int = 40, left_offset: int = 0, center_bias: int = 0) -> PerceptionResult:
         if raw_frame.shape[:2] != (480, 640):
             process_frame = cv2.resize(raw_frame, (640, 480))
         else:
@@ -572,7 +590,9 @@ class VisionPipeline:
         lw = self.tracker.estimated_lane_width
         
         target_x, anchor = self.tracker.get_target_x(
-            y_eval, lw, extra_offset_px, nav_state, self.lost_frames, velocity_ms, last_steering
+            y_eval, lw, extra_offset_px, nav_state, self.lost_frames,
+            velocity_ms, last_steering,
+            right_offset=right_offset, left_offset=left_offset, center_bias=center_bias
         )
         if not hasattr(self, "_target_ema"):
             self._target_ema = target_x
@@ -785,6 +805,8 @@ class StandalonePilot:
         self.running = False
         self._last_ctrl = None
 
+        self.tuner = LaneTuner()
+
     def run(self):
         self.running = True
         log.info("Lane Follower loop started")
@@ -794,6 +816,8 @@ class StandalonePilot:
         
         try:
             while self.running:
+                right_offset, left_offset, center_bias = self.tuner.read()
+
                 ts = time.time()
                 dt = max(ts - t_prev, 0.001)
                 t_prev = ts
@@ -811,7 +835,10 @@ class StandalonePilot:
                     nav_state="NORMAL",
                     velocity_ms=velocity_ms,
                     last_steering=getattr(self._last_ctrl, 'steer_angle_deg', 0.0),
-                    upcoming_curve="STRAIGHT"
+                    upcoming_curve="STRAIGHT",
+                    right_offset=right_offset,
+                    left_offset=left_offset,
+                    center_bias=center_bias,
                 )
 
                 ctrl = self.controller.compute(
