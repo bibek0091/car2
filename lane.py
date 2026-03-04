@@ -552,11 +552,15 @@ class VisionPipeline:
         self.lost_frames = 0
         self.last_target_x = 320.0
         self._heading_ema = 0.0
+        
+        # GUI parameters
+        self.right_offset = 40
+        self.left_offset = 0
+        self.center_bias = 0
 
     def process(self, raw_frame, dt: float = 0.033, extra_offset_px=0.0,
                 nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
-                upcoming_curve: str = "STRAIGHT", pitch_rad: float = 0.0,
-                right_offset: int = 40, left_offset: int = 0, center_bias: int = 0) -> PerceptionResult:
+                upcoming_curve: str = "STRAIGHT", pitch_rad: float = 0.0) -> PerceptionResult:
         if raw_frame.shape[:2] != (480, 640):
             process_frame = cv2.resize(raw_frame, (640, 480))
         else:
@@ -595,7 +599,7 @@ class VisionPipeline:
         target_x, anchor = self.tracker.get_target_x(
             y_eval, lw, extra_offset_px, nav_state, self.lost_frames,
             velocity_ms, last_steering,
-            right_offset=right_offset, left_offset=left_offset, center_bias=center_bias
+            self.right_offset, self.left_offset, self.center_bias
         )
         if not hasattr(self, "_target_ema"):
             self._target_ema = target_x
@@ -823,6 +827,10 @@ class StandalonePilot:
             while self.running:
                 right_offset, left_offset, center_bias = self.tuner.read()
 
+                self.vision.right_offset = right_offset
+                self.vision.left_offset = left_offset
+                self.vision.center_bias = center_bias
+
                 ts = time.time()
                 dt = max(ts - t_prev, 0.001)
                 t_prev = ts
@@ -840,11 +848,10 @@ class StandalonePilot:
                     nav_state="NORMAL",
                     velocity_ms=velocity_ms,
                     last_steering=getattr(self._last_ctrl, 'steer_angle_deg', 0.0),
-                    upcoming_curve="STRAIGHT",
-                    right_offset=right_offset,
-                    left_offset=left_offset,
-                    center_bias=center_bias,
+                    upcoming_curve="STRAIGHT"
                 )
+                
+                print("TARGET_X:", perc.target_x)
 
                 ctrl = self.controller.compute(
                     perc_res=perc, nav_state="NORMAL",
