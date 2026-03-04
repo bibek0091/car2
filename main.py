@@ -762,6 +762,23 @@ class Orchestrator:
         self._sl = tk.Label(self._sf, bg="#1a1a1a"); self._sl.pack(fill=tk.X)
         self._refresh_status_label(np.full((32,1290,3),28,np.uint8))
 
+        # Control bar — at TOP so buttons are always visible without scrolling
+        cb = tk.Frame(root, bg="#111", pady=4); cb.pack(fill=tk.X, padx=6, pady=(2,2))
+        self._sv_pose = tk.StringVar(value="Pose: not set")
+        self._sv_hint = tk.StringVar(value="Click map: set START")
+        tk.Label(cb, textvariable=self._sv_pose, bg="#111", fg="#eee",
+                 font=("Courier",9)).pack(side=tk.LEFT, padx=10)
+        tk.Label(cb, textvariable=self._sv_hint, bg="#111", fg="#ffcc00",
+                 font=("Courier",9,"bold")).pack(side=tk.LEFT, padx=10)
+        bf = tk.Frame(cb, bg="#111"); bf.pack(side=tk.RIGHT, padx=8)
+        for txt, bg, cmd in [("E-STOP",     "#c0392b", self._estop_cb),
+                              ("RESUME",     "#27ae60", self._resume_cb),
+                              ("RESET ROUTE","#2471a3", self._reset_route),
+                              ("START",      "#8e44ad", self._start_pilot)]:
+            tk.Button(bf, text=txt, bg=bg, fg="white",
+                      font=("Courier",9,"bold"),
+                      command=cmd).pack(side=tk.LEFT, padx=4)
+
         # Row 1: MAP+GRAPH | YOLO+CALIB | BEV
         r1 = tk.Frame(root, bg="#0d0d0d"); r1.pack(padx=4, pady=2)
         for col, title, fg, attr, blank in [
@@ -797,19 +814,7 @@ class Orchestrator:
             setattr(self,attr,lbl)
             setattr(self,attr.replace("label","ph"),ph)
 
-        # Control bar
-        cb = tk.Frame(root,bg="#111",pady=5); cb.pack(fill=tk.X,padx=6,pady=(0,4))
-        self._sv_pose = tk.StringVar(value="Pose: not set")
-        self._sv_hint = tk.StringVar(value="Click map: set START")
-        tk.Label(cb,textvariable=self._sv_pose,bg="#111",fg="#eee",font=("Courier",9)).pack(side=tk.LEFT,padx=10)
-        tk.Label(cb,textvariable=self._sv_hint,bg="#111",fg="#ffcc00",font=("Courier",9,"bold")).pack(side=tk.LEFT,padx=10)
-        bf = tk.Frame(cb,bg="#111"); bf.pack(side=tk.RIGHT,padx=8)
-        for txt,bg,cmd in [("E-STOP","#c0392b",self._estop_cb),
-                            ("RESUME","#27ae60",self._resume_cb),
-                            ("RESET ROUTE","#2471a3",self._reset_route),
-                            ("START","#8e44ad",self._start_pilot)]:
-            tk.Button(bf,text=txt,bg=bg,fg="white",font=("Courier",9,"bold"),
-                      command=cmd).pack(side=tk.LEFT,padx=4)
+
 
         self._gui_update()
 
