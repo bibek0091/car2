@@ -429,8 +429,20 @@ class LocalizationPanel:
 
     def render(self, x, y, yaw_deg, yaw_rate, heading_conf, snap_miss,
                confidence, upcoming_curve, curve_dist_m, lat_err_px,
-               velocity_ms, velocity_src, zone, nav_state, l1, l2, l4, health):
+               velocity_ms, velocity_src, zone, nav_state, l1, l2, l4, health,
+               loc_data=None):
+        if loc_data is None: loc_data = {}
         img = np.full((self.H, self.W, 3), 18, np.uint8)
+
+        if not loc_data.get("initialized", False):
+            cv2.rectangle(img, (0, 0), (self.W, self.H), (18, 18, 18), -1)
+            cv2.putText(img, "LOCALIZER NOT INITIALIZED",
+                        (20, self.H // 2 - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 180, 255), 2)
+            cv2.putText(img, "Click start position on map",
+                        (35, self.H // 2 + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1)
+            return img
 
         # Title
         cv2.rectangle(img,(0,0),(self.W,28),(28,28,44),-1)
@@ -1027,8 +1039,18 @@ class Orchestrator:
         calibration_done = False
         safety = SafetySupervisor()   # created AFTER IMU init so timers start fresh
 
+        loc_data = {
+            "x": 0.0, "y": 0.0, "yaw_deg": 0.0,
+            "zone": "CITY", "upcoming_curve": "STRAIGHT",
+            "curve_dist_m": 99.0, "cursor": 0, "speed_ms": 0.0,
+            "initialized": False, "snap_miss": 0,
+            "heading_conf_smoothed": 0.0,
+            "health": {"imu": 0.0, "cam": 0.0, "snap": 0.0, "overall": 0.0},
+        }
+
         try:
             while self.running:
+                loc_data = self.localizer.get_pose_for_dashboard()
                 ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
                 elapsed_run = ts - startup_time
 
@@ -1061,8 +1083,12 @@ class Orchestrator:
                                 self._sv_hint.set("Pilot running…")
                             else:
                                 log.warning("Visual calibration failed — using default BEV transform and zero heading")
+                                initial_heading_rad = 0.0
+                                self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
                         except Exception as e:
                             log.error(f"Calibration finalize() exception: {e} — proceeding with defaults")
+                            initial_heading_rad = 0.0
+                            self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
                         finally:
                             calibration_done = True   # ALWAYS exit calibration phase after elapsed_run > 3.0
                     
@@ -1351,7 +1377,8 @@ class Orchestrator:
                     l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
                     l2=bool(self._planned_path and perc.confidence>0.5),
                     l4=sm<5,
-                    health=loc_data.get("health", {}))
+                    health=loc_data.get("health", {}),
+                    loc_data=loc_data)
                 push_latest(self._q_loc, loc_img)
 
                 # Root Cause C: render map in pilot thread to keep GUI at full 30Hz
