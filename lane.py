@@ -28,7 +28,7 @@ log = logging.getLogger("lane_follower")
 # ── Constants ─────────────────────────────────────────────────────────────────
 TARGET_FPS   = 30
 FRAME_PERIOD = 1.0 / TARGET_FPS
-PWM_DEADBAND = 14.0
+PWM_DEADBAND = 10.0
 
 C_GREEN = ( 50, 220,  50)
 C_AMBER = ( 50, 190, 255)
@@ -75,7 +75,7 @@ class HardwareIO:
         self.video_cap = None
         self.serial    = STM32_SerialHandler()
 
-        self.DEADBAND_PWM  = 12.0
+        self.DEADBAND_PWM  = 0.0       # Adjusted to 0 so constant speed 10 isn't clipped
         self.SPEED_CALIB   = 0.00568   # m/s per PWM unit above deadband
         self.MAX_SPEED_MS  = 0.50
 
@@ -688,9 +688,7 @@ class DividerGuard:
 
 class Controller:
     MAX_STEER      = 45.0
-    MAX_STEER_RATE = 20.0
-    BRAKING_DISTANCE_M = 1.8
-    MIN_CURVE_SPEED_F  = 0.45
+    MAX_STEER_RATE = 25.0
 
     def __init__(self):
         self.prev_steer = 0.0
@@ -698,7 +696,7 @@ class Controller:
         self.stanley    = StanleyController(k=1.8, ks=0.2, wheelbase_m=0.23)
 
     def compute(self, perc_res, nav_state: str = "NORMAL", velocity_ms: float = 0.0,
-                dt: float = 0.033, base_speed: float = 50.0, traffic_mult: float = 1.0,
+                dt: float = 0.033, traffic_mult: float = 1.0,
                 map_curvature: float = 0.0, upcoming_curve: str = "STRAIGHT",
                 curve_dist_m: float = 99.0) -> ControlOutput:
 
@@ -716,34 +714,8 @@ class Controller:
             steer_angle, perc_res.sl, perc_res.sr, y_eval=perc_res.y_eval)
         steer_angle = max(-self.MAX_STEER, min(self.MAX_STEER, steer_guarded))
 
-        speed           = float(base_speed)
-        min_curve_speed = base_speed * self.MIN_CURVE_SPEED_F
-
-        # Dynamic Vision-Based Turn Braking
-        # Uses the real-time visual curvature to dynamically slow the car down in corners
-        if perc_res.curvature > 0.0015:
-            # Ramp down speed based on visual curvature severity
-            # 0.0015 = Start slowing down (mild curve)
-            # 0.0040 = Max slow down to min_curve_speed (sharp curve)
-            severity = min(1.0, (perc_res.curvature - 0.0015) / 0.0025)
-            braked_speed = base_speed - (base_speed - min_curve_speed) * severity
-            speed = min(speed, braked_speed)
-        elif abs(steer_angle) < 5:
-            speed = min(speed * 1.15, base_speed * 1.20)
-
-        if "DEAD_RECKONING" in perc_res.anchor:
-            try: dr_conf = float(perc_res.anchor.split("_")[2])
-            except: dr_conf = 0.5
-            speed *= (0.4 + 0.4 * dr_conf)
-
-        if perc_res.anchor in ("DIVIDER_FOLLOW", "RL_FROM_DIVIDER"):
-            speed *= 0.75
-
-        final_speed = speed * traffic_mult * guard_spd_mult
-
-        MINIMUM_DRIVE_PWM = 18.0
-        if final_speed > 0:
-            final_speed = max(final_speed, MINIMUM_DRIVE_PWM)
+        # A constant slower speed of 10 replaces all variable dynamic speed calculations
+        final_speed = 10.0
 
         return ControlOutput(
             steer_angle_deg = steer_angle,
@@ -805,9 +777,8 @@ def _annotate_bev(perc, ctrl):
 
 class StandalonePilot:
     """A stripped-down autonomous orchestrator that purely tracks and follows the lane."""
-    def __init__(self, sim_mode=False, base_speed=40.0, sim_video=None):
+    def __init__(self, sim_mode=False, sim_video=None):
         self.sim_mode = sim_mode
-        self.base_speed = base_speed
         self.hw = HardwareIO(sim_mode=sim_mode, sim_video=sim_video)
         self.vision = VisionPipeline()
         self.controller = Controller()
@@ -845,7 +816,6 @@ class StandalonePilot:
 
                 ctrl = self.controller.compute(
                     perc_res=perc, nav_state="NORMAL",
-                    base_speed=float(self.base_speed),
                     traffic_mult=1.0,
                     velocity_ms=velocity_ms, dt=dt,
                     map_curvature=0.0,
@@ -860,7 +830,7 @@ class StandalonePilot:
                     cv2.putText(perc.lane_dbg, f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
                                 (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                 elif elapsed_run < 6.0:
-                    ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
+                    ctrl.speed_pwm = min(ctrl.speed_pwm, 10.0)
                     cv2.putText(perc.lane_dbg, f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
                                 (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
 
@@ -872,8 +842,7 @@ class StandalonePilot:
                     self.hw.set_steering(0)
                 else:
                     speed = ctrl.speed_pwm
-                    if _ll >= _LLC: speed = min(speed, 20.0)
-                    if 0.0 < speed < self.hw.DEADBAND_PWM: speed = self.hw.DEADBAND_PWM
+                    if _ll >= _LLC: speed = min(speed, 10.0)
                     self.hw.set_speed(speed)
                     self.hw.set_steering(ctrl.steer_angle_deg)
 
@@ -901,9 +870,8 @@ class StandalonePilot:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Standalone Lane Detection and Following")
     ap.add_argument("--sim",       action="store_true", help="Run in simulation mode")
-    ap.add_argument("--speed",     type=float, default=40.0, help="Base speed PWM")
     ap.add_argument("--sim-video", type=str,   default=None, help="Path to video for testing")
     args = ap.parse_args()
 
-    pilot = StandalonePilot(sim_mode=args.sim, base_speed=args.speed, sim_video=args.sim_video)
+    pilot = StandalonePilot(sim_mode=args.sim, sim_video=args.sim_video)
     pilot.run()
