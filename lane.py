@@ -420,19 +420,19 @@ class HybridLaneTracker:
             predicted_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
             return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
 
-        if has_right:
-            if has_left:
-                # Exactly in the middle when both lines are visible
-                base_x = (ev(sl) + ev(sr)) / 2.0
-                anchor = "RL_DUAL"
-            else:
-                # Keep an extra offset to the left from the right edge to avoid touching it
-                # 'hw' is half lane width. Subtracting an extra 20px pushes the target leftward.
-                base_x = ev(sr) - hw - 20
-                anchor = "RL_FROM_EDGE"
+        if has_right and has_left:
+            # Exactly in the middle when both lines are visible
+            base_x = (ev(sl) + ev(sr)) / 2.0
+            anchor = "RL_DUAL"
+        elif has_right:
+            # Keep an extra offset to the left from the right edge to avoid touching it
+            # 'hw' is half lane width. Subtracting an extra 40px pushes the target securely leftward.
+            base_x = ev(sr) - hw - 40
+            anchor = "RL_FROM_EDGE"
         else:
-            base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
-            anchor = "DIVIDER_FOLLOW"
+            # Only left line is visible. Project target to the middle of the lane.
+            base_x = ev(sl) + hw
+            anchor = "RL_FROM_DIVIDER"
 
         self.dead_reckoner.last_valid_target    = base_x
         self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
@@ -650,8 +650,8 @@ class StanleyController:
 
 
 class DividerGuard:
-    DIVIDER_SAFE_PX = 130
-    EDGE_SAFE_PX    = 100
+    DIVIDER_SAFE_PX = 110
+    EDGE_SAFE_PX    = 110
     GAIN            = 0.35
     MAX_CORR        = 25.0
     DEADBAND_PX     =  2
@@ -719,9 +719,14 @@ class Controller:
         speed           = float(base_speed)
         min_curve_speed = base_speed * self.MIN_CURVE_SPEED_F
 
-        if upcoming_curve != "STRAIGHT" and curve_dist_m < self.BRAKING_DISTANCE_M:
-            decel_factor = max(0.0, curve_dist_m / self.BRAKING_DISTANCE_M)
-            braked_speed = min_curve_speed + (base_speed - min_curve_speed) * decel_factor
+        # Dynamic Vision-Based Turn Braking
+        # Uses the real-time visual curvature to dynamically slow the car down in corners
+        if perc_res.curvature > 0.0015:
+            # Ramp down speed based on visual curvature severity
+            # 0.0015 = Start slowing down (mild curve)
+            # 0.0040 = Max slow down to min_curve_speed (sharp curve)
+            severity = min(1.0, (perc_res.curvature - 0.0015) / 0.0025)
+            braked_speed = base_speed - (base_speed - min_curve_speed) * severity
             speed = min(speed, braked_speed)
         elif abs(steer_angle) < 5:
             speed = min(speed * 1.15, base_speed * 1.20)
@@ -731,7 +736,7 @@ class Controller:
             except: dr_conf = 0.5
             speed *= (0.4 + 0.4 * dr_conf)
 
-        if perc_res.anchor == "DIVIDER_FOLLOW":
+        if perc_res.anchor in ("DIVIDER_FOLLOW", "RL_FROM_DIVIDER"):
             speed *= 0.75
 
         final_speed = speed * traffic_mult * guard_spd_mult
