@@ -31,14 +31,16 @@ class BNO055_IMU:
 
     def _initialize_sensor(self):
 
-        print("Starting BNO055...")
+        print("Starting BNO055")
+
         time.sleep(1)
 
         chip_id = self._read8(0x00)
+
         print("Chip ID:", hex(chip_id))
 
         if chip_id != 0xA0:
-            raise RuntimeError("BNO055 sensor not detected")
+            raise RuntimeError("BNO055 not detected")
 
         print("Sensor detected")
 
@@ -54,26 +56,26 @@ class BNO055_IMU:
 
     def read_orientation(self):
 
-        heading = self._read16(0x1A)
-        roll = self._read16(0x1C)
-        pitch = self._read16(0x1E)
-
-        heading = heading / 16.0
-        roll = roll / 16.0
-        pitch = pitch / 16.0
+        heading = self._read16(0x1A) / 16.0
+        roll = self._read16(0x1C) / 16.0
+        pitch = self._read16(0x1E) / 16.0
 
         return heading, roll, pitch
 
     def read_yaw(self):
+
         heading, _, _ = self.read_orientation()
+
         return math.radians(heading)
 
 
-# ---------------------------------------------------------
-# Standalone test mode
-# ---------------------------------------------------------
+# ---------------------------
+# Standalone Test
+# ---------------------------
 
 if __name__ == "__main__":
+
+    print("Running standalone IMU test")
 
     imu = BNO055_IMU()
 
@@ -81,6 +83,6 @@ if __name__ == "__main__":
 
         yaw, roll, pitch = imu.read_orientation()
 
-        print(f"Yaw: {yaw:.2f}  Roll: {roll:.2f}  Pitch: {pitch:.2f}")
+        print("Yaw:", yaw, "Roll:", roll, "Pitch:", pitch)
 
         time.sleep(0.1)
