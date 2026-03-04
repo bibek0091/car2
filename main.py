@@ -1050,378 +1050,388 @@ class Orchestrator:
 
         try:
             while self.running:
-                loc_data = self.localizer.get_pose_for_dashboard()
-                ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
-                elapsed_run = ts - startup_time
+                try:
+                    loc_data = self.localizer.get_pose_for_dashboard()
+                    ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
+                    elapsed_run = ts - startup_time
 
-                # Always read camera & velocity so dashboard stays live
-                raw_frame   = self.hw.read_camera()
-                if raw_frame is None:
-                    raw_frame = np.zeros((480, 640, 3), np.uint8)
-                elif raw_frame.any():
-                    safety.update_camera()
-                velocity_ms = self.hw.get_velocity()
-                safety.update_serial()   # always update — serial health checked separately
-                safety.update_yolo()     # always alive — traffic check handled separately
+                    # Always read camera & velocity so dashboard stays live
+                    raw_frame   = self.hw.read_camera()
+                    if raw_frame is None:
+                        raw_frame = np.zeros((480, 640, 3), np.uint8)
+                    elif raw_frame.any():
+                        safety.update_camera()
+                    velocity_ms = self.hw.get_velocity()
+                    safety.update_serial()   # always update — serial health checked separately
+                    safety.update_yolo()     # always alive — traffic check handled separately
 
-                if not calibration_done:
-                    calib.add_frame(raw_frame)
-                    self._sv_hint.set(calib._result.status_msg)
-                    self.hw.set_speed(0)
-                    self.hw.set_steering(0)
-                    safety.update_yolo()   # keep safety supervisor alive during calibration
-                    
-                    if elapsed_run > 3.0:
-                        try:
-                            result = calib.finalize()
-                            if result.success:
-                                self.vision.update_bev_transform(result.src_pts)
-                                initial_heading_rad = math.radians(result.initial_heading_deg)
-                                self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
-                                imu_heading = imu.get_yaw()
-                                imu.set_offset(initial_heading_rad - imu_heading)
-                                self._sv_hint.set("Pilot running…")
-                            else:
-                                log.warning("Visual calibration failed — using default BEV transform and zero heading")
+                    if not calibration_done:
+                        calib.add_frame(raw_frame)
+                        self._sv_hint.set(calib._result.status_msg)
+                        self.hw.set_speed(0)
+                        self.hw.set_steering(0)
+                        safety.update_yolo()   # keep safety supervisor alive during calibration
+
+                        if elapsed_run > 3.0:
+                            try:
+                                result = calib.finalize()
+                                if result.success:
+                                    self.vision.update_bev_transform(result.src_pts)
+                                    initial_heading_rad = math.radians(result.initial_heading_deg)
+                                    self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
+                                    imu_heading = imu.get_yaw()
+                                    imu.set_offset(initial_heading_rad - imu_heading)
+                                    self._sv_hint.set("Pilot running…")
+                                else:
+                                    log.warning("Visual calibration failed — using default BEV transform and zero heading")
+                                    initial_heading_rad = 0.0
+                                    self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
+                            except Exception as e:
+                                log.error(f"Calibration finalize() exception: {e} — proceeding with defaults")
                                 initial_heading_rad = 0.0
                                 self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
-                        except Exception as e:
-                            log.error(f"Calibration finalize() exception: {e} — proceeding with defaults")
-                            initial_heading_rad = 0.0
-                            self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
-                        finally:
-                            calibration_done = True   # ALWAYS exit calibration phase after elapsed_run > 3.0
-                    
-                    # Keep dashboard updated during calibration
-                    self._last_perc = self.vision.process(raw_frame)
-                    push_latest(self._q_bev, _annotate_bev(
-                        self._last_perc, self._last_ctrl))   # BEV live during calibration
-                    if self.traffic_engine:
-                        self._last_t_res = self.traffic_engine.process(raw_frame, "CONTINUOUS")
-                    else:
-                        self._last_t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
-                        
-                    elapsed = time.time()-ts
+                            finally:
+                                calibration_done = True   # ALWAYS exit calibration phase after elapsed_run > 3.0
 
-                    # ── CALIBRATION OVERLAY — pushed to camera panel ─────────────────
-                    calib_vis = raw_frame.copy()
-                    h_vis, w_vis = calib_vis.shape[:2]
-
-                    # Draw vanishing-point candidates accumulated so far
-                    try:
-                        from visual_calibrator import _detect_vanishing_point
-                        vp = _detect_vanishing_point(raw_frame)
-                        if vp is not None:
-                            vx, vy = int(vp[0]), int(vp[1])
-                            cv2.drawMarker(calib_vis, (vx, vy), (0, 255, 255),
-                                           cv2.MARKER_CROSS, 30, 2, cv2.LINE_AA)
-                            cv2.circle(calib_vis, (vx, vy), 12, (0, 255, 255), 2)
-                            _lbl(calib_vis, f"VP ({vx},{vy})", vx+14, vy-8,
-                                 scale=0.5, color=(0,255,255))
-                    except Exception:
-                        pass  # visual_calibrator may not export _detect_vanishing_point
-
-                    # Draw the BEV trapezoid SRC_PTS on the camera frame
-                    src = self.vision.SRC_PTS.astype(np.int32)
-                    cv2.polylines(calib_vis, [src[[0,1,3,2]].reshape(-1,1,2)],
-                                  True, (0, 180, 255), 2, cv2.LINE_AA)
-                    for pt in src:
-                        cv2.circle(calib_vis, tuple(pt), 5, (0,180,255), -1)
-                    _lbl(calib_vis, "BEV TRAPEZOID",
-                         int(src[:,0].mean())-50, int(src[:,1].min())-8,
-                         scale=0.4, color=(0,180,255))
-
-                    # Status bar with VP/HDG candidate counts
-                    n_vp  = len(getattr(calib, '_vp_candidates',  []))
-                    n_hdg = len(getattr(calib, '_heading_candidates', []))
-                    n_frm = len(getattr(calib, '_frames', []))
-                    bar_txt = (f"CALIBRATING  frames={n_frm}  "
-                               f"VP={n_vp}  HDG={n_hdg}  "
-                               f"t={elapsed_run:.1f}s / 3.0s")
-                    cv2.rectangle(calib_vis, (0, 0), (w_vis, 28), (20,20,20), -1)
-                    _lbl(calib_vis, bar_txt, 8, 20, scale=0.45, color=(50,220,220))
-
-                    # Countdown arc (top-right corner)
-                    frac = min(elapsed_run / 3.0, 1.0)
-                    cv2.ellipse(calib_vis, (w_vis-36, 36), (28, 28), -90,
-                                0, int(frac * 360), (0,200,100), 3, cv2.LINE_AA)
-                    _lbl(calib_vis, f"{max(0.0, 3.0-elapsed_run):.1f}s",
-                         w_vis-52, 42, scale=0.40, color=(0,200,100))
-
-                    push_latest(self._q_yolo, calib_vis)
-                    # ── END calibration overlay ───────────────────────────────────────
-
-                    time.sleep(max(0.001, FRAME_PERIOD-elapsed))
-                    continue
-
-                # --- EXTRACT PREDICTIVE MAP DATA (available even during E-STOP) ---
-                upcoming_curve = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
-                curve_dist_m   = getattr(self.localizer, 'curve_dist_m',   99.0)
-                # Smooth curve distance to prevent braking oscillation from discrete waypoint jumps
-                if curve_dist_m < 99.0:
-                    self._curve_dist_ema = (self._CURVE_EMA_ALPHA * curve_dist_m
-                                            + (1.0 - self._CURVE_EMA_ALPHA) * self._curve_dist_ema)
-                else:
-                    self._curve_dist_ema = min(self._curve_dist_ema + 0.05, 99.0)  # slowly recover
-                curve_dist_m = self._curve_dist_ema   # use smoothed value for controller
-                map_curvature  = 0.0
-                if self._planned_path and self.localizer.planner:
-                    try:
-                        _curv_zone = getattr(self.localizer, 'current_zone', 'CITY')
-                        _curv_win  = 0.8 if _curv_zone == 'CITY' else 1.2
-                        map_curvature = self.localizer.planner.get_path_curvature(
-                            self.localizer.x, self.localizer.y,
-                            self._planned_path,
-                            cursor=self._path_cursor,
-                            window_m=_curv_win)
-                    except Exception:
-                        pass
-
-                self._fps = 0.7*self._fps + 0.3*(1.0/dt)
-
-                # --- TRAFFIC ENGINE (runs even in E-STOP for YOLO feed) ---
-                if self.traffic_engine:
-                    x0,y0,_ = self.localizer.get_pose()
-                    ei = {}
-                    if self._planned_path and self.localizer.planner:
-                        ei = self.localizer.planner.get_current_edge_info(
-                            x0,y0,self._planned_path,self._path_cursor)
-                    t_res = self.traffic_engine.process(
-                        raw_frame, "DASHED" if ei.get("dotted") else "CONTINUOUS")
-                else:
-                    t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
-                
-                if self._threaded_yolo and not self._threaded_yolo.is_alive():
-                    t_res.speed_multiplier = 0.3
-
-                # Smooth the traffic multiplier — YOLO detections are noisy frame-to-frame
-                self._traffic_mult_ema = (self._TRAFFIC_EMA_ALPHA * t_res.speed_multiplier
-                                          + (1.0 - self._TRAFFIC_EMA_ALPHA) * self._traffic_mult_ema)
-
-                self._last_t_res = t_res
-
-                if self._estop:
-                    # Halted — keep motors off, reuse last perception for dashboard
-                    self.hw.set_speed(0); self.hw.set_steering(0)
-                    perc = self._last_perc if self._last_perc else self.vision.process(raw_frame)
-                    ctrl = self._last_ctrl
-
-                    # F-15: Auto-recovery — attempt re-detection every loop tick.
-                    # If lanes are visible again, clear E-STOP and resume driving.
-                    try:
-                        recovery_perc = self.vision.process(raw_frame, dt=dt)
-                        if recovery_perc.confidence > 0.4:
-                            self._estop = False
-                            _ll = 0
-                            log.info("F-15: E-STOP cleared — lanes re-detected (conf=%.2f)", recovery_perc.confidence)
-                    except Exception:
-                        pass
-
-                else:
-                    # --- NORMAL DRIVING ---
-                    now = time.time()
-                    for n,t in list(self._blocked_nodes.items()):
-                        if now>=t: del self._blocked_nodes[n]
-
-                    for lbl in t_res.active_labels:
-                        for kw in ("stop","traffic","highway","roundabout","parking",
-                                   "crosswalk","priority","no-entry","speed"):
-                            if kw in lbl.lower():
-                                self._sign_history.append((lbl,0.9,time.time())); break
-
-                    if ("NO-ENTRY" in t_res.reason and self._planned_path and self.localizer.planner):
-                        xne,yne,_ = self.localizer.get_pose()
-                        nn = self.localizer.planner.get_nearest_node(xne,yne)
-                        if nn and nn not in self._blocked_nodes:
-                            self._blocked_nodes[nn] = time.time()+30.0
-                            if nn in self.localizer.planner.graph:
-                                self.localizer.planner.graph.remove_node(nn)
-                                rem = [n for n in self.localizer.planner._node_ids
-                                       if n in self.localizer.planner.graph]
-                                import scipy.spatial
-                                self.localizer.planner._node_ids = rem
-                                self.localizer.planner._kdtree = scipy.spatial.KDTree(
-                                    [self.localizer.planner.node_positions[n] for n in rem])
-                                ns2 = self.localizer.planner.get_nearest_node(xne,yne)
-                                np2 = self.localizer.planner.plan_route(ns2,self._target_node)
-                                self.localizer.planner.load_graph("Competition_track_graph.graphml")
-                                if np2:
-                                    self._planned_path=np2; self._path_cursor=0
-                                    self.localizer.reset_cursor()
-
-                    if self.localizer.planner and self.localizer.is_initialized():
-                        xz,yz,_ = self.localizer.get_pose()
-                        mz = self.localizer.planner.get_zone(xz,yz)
-                        _zmf = _zmf+1 if mz!=t_res.zone_mode else 0
-                        if _zmf>=90 and self.traffic_engine:
-                            self.traffic_engine._zone_mode=mz; _zmf=0
-
-                    extra_offset = -80.0 if t_res.state=="SYS_LANE_CHANGE_LEFT" else 0.0
-
-                    if (self._planned_path and self.localizer.planner
-                            and 0<=self._path_cursor<len(self._planned_path)):
-                        node_now = self._planned_path[self._path_cursor]
-                        if self.localizer.planner.is_roundabout_node(node_now):
-                            if self._nav_state=="NORMAL": self._nav_state="ROUNDABOUT"
-                        elif self._nav_state=="ROUNDABOUT": self._nav_state="NORMAL"
-
-                    perc = self.vision.process(
-                        raw_frame,
-                        dt=dt,
-                        extra_offset_px=extra_offset,
-                        nav_state=self._nav_state,
-                        velocity_ms=velocity_ms,
-                        last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0),
-                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'))
-                    self._last_conf = perc.confidence; self._last_perc = perc
-
-                    self._nav_state = self.jct_detector.update(
-                        perc.warped_binary,perc.sl,perc.sr,perc.lane_width_px,t_res.active_labels)
-
-                    if self._nav_state=="JUNCTION_PROMPT":
-                        if self._planned_path and self.localizer.planner:
-                            xj,yj,yj2 = self.localizer.get_pose()
-                            action = self.localizer.planner.get_next_action(
-                                xj,yj,yj2,path=self._planned_path,
-                                cursor=self._path_cursor,velocity_ms=velocity_ms)
-                            self._nav_state = f"JUNCTION_{action}"
-                        else: self._nav_state="JUNCTION_STRAIGHT"
-
-                    self.localizer.update(
-                        velocity_ms=velocity_ms, dt=dt,
-                        camera_heading_rad=perc.heading_rad,
-                        camera_confidence=perc.confidence,
-                        heading_conf=perc.heading_conf,
-                        path=self._planned_path,
-                        optical_yaw_rate=perc.optical_yaw_rate,
-                        optical_vel=perc.optical_vel,
-                        current_steer_rad=math.radians(getattr(self._last_ctrl,'steer_angle_deg',0.0)))
-                    self._path_cursor = self.localizer.path_cursor
-
-                    # IMU correction runs AFTER dead-reckoning, not before.
-                    # This way IMU corrects the result of all layers, not just
-                    # the opening state that Layers 1-4 then override.
-                    imu_yaw = imu.read_yaw()
-                    self.localizer.update_imu_yaw(imu_yaw)
-
-                    self.localizer.get_upcoming_curve_from_path(
-                        self._planned_path,self._path_cursor,velocity_ms)
-
-                    ctrl = self.controller.compute(
-                        perc_res=perc, nav_state=self._nav_state,
-                        base_speed=float(self.base_speed),
-                        traffic_mult=self._traffic_mult_ema,   # smoothed, not raw
-                        velocity_ms=velocity_ms, dt=dt,
-                        map_curvature=map_curvature,
-                        upcoming_curve=upcoming_curve,
-                        curve_dist_m=curve_dist_m)
-
-                    # --- STARTUP CALIBRATION OVERRIDE ---
-                    # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
-                    # Stage 2 (3-6 s): crawl at ≤15 PWM — warm up EMA lane tracker.
-                    if not calibration_done:
-                        if elapsed_run < 3.0:
-                            ctrl.speed_pwm       = 0.0
-                            ctrl.steer_angle_deg = 0.0
-                            cv2.putText(perc.lane_dbg,
-                                f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
-                                (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-                        elif elapsed_run < 6.0:
-                            ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
-                            cv2.putText(perc.lane_dbg,
-                                f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
-                                (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
-
-                    safety.update_encoder()   # stamp encoder liveness each pilot frame
-                    ctrl.speed_pwm *= safety.safe_speed_override()
-
-                    self._last_ctrl = ctrl
-
-                    # Both lanes lost: count toward E-STOP
-                    _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
-                    if _ll >= _LLS:
-                        self.hw.set_speed(0); self.hw.set_steering(0)
-                        self._estop = True
-                    else:
-                        speed = ctrl.speed_pwm
-                        if _ll >= _LLC:
-                            speed = min(speed, 20.0)   # both lost: crawl
-
-                        # Single-lane-lost: sr gone (DIVIDER_FOLLOW or RL_FROM_EDGE stale)
-                        # Reduce to 70% of base to buy time for lane recovery.
-                        # sl visible alone is enough to trigger this.
-                        elif perc.sr is None and perc.sl is not None:
-                            speed = min(speed, ctrl.speed_pwm * 0.70)
-
-                        # Dead reckoning with decayed confidence: additional penalty
-                        if "DEAD_RECKONING" in perc.anchor:
-                            try:
-                                dr_conf = float(perc.anchor.split("_")[2])
-                            except Exception:
-                                dr_conf = 0.5
-                            if dr_conf < 0.5:   # only cut when confidence is low
-                                speed = min(speed, ctrl.speed_pwm * 0.55)
-
-                        # Traffic Manager speed limit
-                        limit = self.tm.get_speed_limit(self._path_cursor, getattr(self.localizer,'zone','CITY'))
-                        speed = min(speed, limit)
-
-                        if 0.0 < speed < PWM_DEADBAND: speed = PWM_DEADBAND
-
-                        # Low-pass filter: smooth speed commands so jitter doesn't reach the motor
-                        if speed == 0.0:
-                            self._speed_ema = 0.0      # hard zero on E-STOP / stop commands
+                        # Keep dashboard updated during calibration
+                        self._last_perc = self.vision.process(raw_frame)
+                        push_latest(self._q_bev, _annotate_bev(
+                            self._last_perc, self._last_ctrl))   # BEV live during calibration
+                        if self.traffic_engine:
+                            self._last_t_res = self.traffic_engine.process(raw_frame, "CONTINUOUS")
                         else:
-                            self._speed_ema = (self._SPEED_EMA_ALPHA * speed
-                                               + (1.0 - self._SPEED_EMA_ALPHA) * self._speed_ema)
-                            if self._speed_ema < PWM_DEADBAND:
-                                self._speed_ema = PWM_DEADBAND
+                            self._last_t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
 
-                        self.hw.set_speed(self._speed_ema); self.hw.set_steering(ctrl.steer_angle_deg)
+                        elapsed = time.time()-ts
 
-                # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
-                yolo_frame = t_res.yolo_debug_frame if (t_res is not None and getattr(t_res, 'yolo_debug_frame', None) is not None) else raw_frame
-                push_latest(self._q_yolo, yolo_frame)
-                push_latest(self._q_bev, _annotate_bev(perc, ctrl))
+                        # ── CALIBRATION OVERLAY — pushed to camera panel ─────────────────
+                        calib_vis = raw_frame.copy()
+                        h_vis, w_vis = calib_vis.shape[:2]
 
-                # VIZ-03: localization panel
-                sm     = getattr(self.localizer,'_snap_miss_frames',0)
-                lx,ly,lyaw = self.localizer.get_pose()
-                yr     = self.localizer.visual_yaw_rate
-                self._loc_panel.push(yr, perc.lateral_error_px, lx, ly, sm==0)
-                vm_src_loc = self.hw.get_velocity_source()
-                loc_img = self._loc_panel.render(
-                    x=lx, y=ly, yaw_deg=math.degrees(lyaw),
-                    yaw_rate=yr, heading_conf=perc.heading_conf,
-                    snap_miss=sm, confidence=perc.confidence,
-                    upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
-                    curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0),
-                    lat_err_px=perc.lateral_error_px, velocity_ms=velocity_ms,
-                    velocity_src=vm_src_loc,
-                    zone=self.localizer.current_zone, nav_state=self._nav_state,
-                    l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
-                    l2=bool(self._planned_path and perc.confidence>0.5),
-                    l4=sm<5,
-                    health=loc_data.get("health", {}),
-                    loc_data=loc_data)
-                push_latest(self._q_loc, loc_img)
+                        # Draw vanishing-point candidates accumulated so far
+                        try:
+                            from visual_calibrator import _detect_vanishing_point
+                            vp = _detect_vanishing_point(raw_frame)
+                            if vp is not None:
+                                vx, vy = int(vp[0]), int(vp[1])
+                                cv2.drawMarker(calib_vis, (vx, vy), (0, 255, 255),
+                                               cv2.MARKER_CROSS, 30, 2, cv2.LINE_AA)
+                                cv2.circle(calib_vis, (vx, vy), 12, (0, 255, 255), 2)
+                                _lbl(calib_vis, f"VP ({vx},{vy})", vx+14, vy-8,
+                                     scale=0.5, color=(0,255,255))
+                        except Exception:
+                            pass  # visual_calibrator may not export _detect_vanishing_point
 
-                # Root Cause C: render map in pilot thread to keep GUI at full 30Hz
-                if self.localizer.is_initialized():
-                    snap_miss_m = getattr(self.localizer, '_snap_miss_frames', 0)
-                    hconf_raw_m = getattr(self.localizer, '_cam_yaw_smoothed', 0.0)
-                    conf_m = self._last_conf
-                    zone_m = self.localizer.current_zone
-                    map_img = self._map_renderer.render(
-                        lx, ly, lyaw,
-                        self._planned_path, self._path_cursor,
-                        self.localizer.planner, conf_m, zone_m,
-                        snap_miss=snap_miss_m,
-                        heading_conf=abs(hconf_raw_m) * 2.0)
-                    push_latest(self._q_map, map_img)
+                        # Draw the BEV trapezoid SRC_PTS on the camera frame
+                        src = self.vision.SRC_PTS.astype(np.int32)
+                        cv2.polylines(calib_vis, [src[[0,1,3,2]].reshape(-1,1,2)],
+                                      True, (0, 180, 255), 2, cv2.LINE_AA)
+                        for pt in src:
+                            cv2.circle(calib_vis, tuple(pt), 5, (0,180,255), -1)
+                        _lbl(calib_vis, "BEV TRAPEZOID",
+                             int(src[:,0].mean())-50, int(src[:,1].min())-8,
+                             scale=0.4, color=(0,180,255))
 
-                elapsed = time.time()-ts
-                time.sleep(max(0.001, FRAME_PERIOD-elapsed))
+                        # Status bar with VP/HDG candidate counts
+                        n_vp  = len(getattr(calib, '_vp_candidates',  []))
+                        n_hdg = len(getattr(calib, '_heading_candidates', []))
+                        n_frm = len(getattr(calib, '_frames', []))
+                        bar_txt = (f"CALIBRATING  frames={n_frm}  "
+                                   f"VP={n_vp}  HDG={n_hdg}  "
+                                   f"t={elapsed_run:.1f}s / 3.0s")
+                        cv2.rectangle(calib_vis, (0, 0), (w_vis, 28), (20,20,20), -1)
+                        _lbl(calib_vis, bar_txt, 8, 20, scale=0.45, color=(50,220,220))
+
+                        # Countdown arc (top-right corner)
+                        frac = min(elapsed_run / 3.0, 1.0)
+                        cv2.ellipse(calib_vis, (w_vis-36, 36), (28, 28), -90,
+                                    0, int(frac * 360), (0,200,100), 3, cv2.LINE_AA)
+                        _lbl(calib_vis, f"{max(0.0, 3.0-elapsed_run):.1f}s",
+                             w_vis-52, 42, scale=0.40, color=(0,200,100))
+
+                        push_latest(self._q_yolo, calib_vis)
+                        # ── END calibration overlay ───────────────────────────────────────
+
+                        time.sleep(max(0.001, FRAME_PERIOD-elapsed))
+                        continue
+
+                    # --- EXTRACT PREDICTIVE MAP DATA (available even during E-STOP) ---
+                    upcoming_curve = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
+                    curve_dist_m   = getattr(self.localizer, 'curve_dist_m',   99.0)
+                    # Smooth curve distance to prevent braking oscillation from discrete waypoint jumps
+                    if curve_dist_m < 99.0:
+                        self._curve_dist_ema = (self._CURVE_EMA_ALPHA * curve_dist_m
+                                                + (1.0 - self._CURVE_EMA_ALPHA) * self._curve_dist_ema)
+                    else:
+                        self._curve_dist_ema = min(self._curve_dist_ema + 0.05, 99.0)  # slowly recover
+                    curve_dist_m = self._curve_dist_ema   # use smoothed value for controller
+                    map_curvature  = 0.0
+                    if self._planned_path and self.localizer.planner:
+                        try:
+                            _curv_zone = getattr(self.localizer, 'current_zone', 'CITY')
+                            _curv_win  = 0.8 if _curv_zone == 'CITY' else 1.2
+                            map_curvature = self.localizer.planner.get_path_curvature(
+                                self.localizer.x, self.localizer.y,
+                                self._planned_path,
+                                cursor=self._path_cursor,
+                                window_m=_curv_win)
+                        except Exception:
+                            pass
+
+                    self._fps = 0.7*self._fps + 0.3*(1.0/dt)
+
+                    # --- TRAFFIC ENGINE (runs even in E-STOP for YOLO feed) ---
+                    if self.traffic_engine:
+                        x0,y0,_ = self.localizer.get_pose()
+                        ei = {}
+                        if self._planned_path and self.localizer.planner:
+                            ei = self.localizer.planner.get_current_edge_info(
+                                x0,y0,self._planned_path,self._path_cursor)
+                        t_res = self.traffic_engine.process(
+                            raw_frame, "DASHED" if ei.get("dotted") else "CONTINUOUS")
+                    else:
+                        t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
+
+                    if self._threaded_yolo and not self._threaded_yolo.is_alive():
+                        t_res.speed_multiplier = 0.3
+
+                    # Smooth the traffic multiplier — YOLO detections are noisy frame-to-frame
+                    self._traffic_mult_ema = (self._TRAFFIC_EMA_ALPHA * t_res.speed_multiplier
+                                              + (1.0 - self._TRAFFIC_EMA_ALPHA) * self._traffic_mult_ema)
+
+                    self._last_t_res = t_res
+
+                    if self._estop:
+                        # Halted — keep motors off, reuse last perception for dashboard
+                        self.hw.set_speed(0); self.hw.set_steering(0)
+                        perc = self._last_perc if self._last_perc else self.vision.process(raw_frame)
+                        ctrl = self._last_ctrl
+
+                        # F-15: Auto-recovery — attempt re-detection every loop tick.
+                        # If lanes are visible again, clear E-STOP and resume driving.
+                        try:
+                            recovery_perc = self.vision.process(raw_frame, dt=dt)
+                            if recovery_perc.confidence > 0.4:
+                                self._estop = False
+                                _ll = 0
+                                log.info("F-15: E-STOP cleared — lanes re-detected (conf=%.2f)", recovery_perc.confidence)
+                        except Exception:
+                            pass
+
+                    else:
+                        # --- NORMAL DRIVING ---
+                        now = time.time()
+                        for n,t in list(self._blocked_nodes.items()):
+                            if now>=t: del self._blocked_nodes[n]
+
+                        for lbl in t_res.active_labels:
+                            for kw in ("stop","traffic","highway","roundabout","parking",
+                                       "crosswalk","priority","no-entry","speed"):
+                                if kw in lbl.lower():
+                                    self._sign_history.append((lbl,0.9,time.time())); break
+
+                        if ("NO-ENTRY" in t_res.reason and self._planned_path and self.localizer.planner):
+                            xne,yne,_ = self.localizer.get_pose()
+                            nn = self.localizer.planner.get_nearest_node(xne,yne)
+                            if nn and nn not in self._blocked_nodes:
+                                self._blocked_nodes[nn] = time.time()+30.0
+                                if nn in self.localizer.planner.graph:
+                                    self.localizer.planner.graph.remove_node(nn)
+                                    rem = [n for n in self.localizer.planner._node_ids
+                                           if n in self.localizer.planner.graph]
+                                    import scipy.spatial
+                                    self.localizer.planner._node_ids = rem
+                                    self.localizer.planner._kdtree = scipy.spatial.KDTree(
+                                        [self.localizer.planner.node_positions[n] for n in rem])
+                                    ns2 = self.localizer.planner.get_nearest_node(xne,yne)
+                                    np2 = self.localizer.planner.plan_route(ns2,self._target_node)
+                                    self.localizer.planner.load_graph("Competition_track_graph.graphml")
+                                    if np2:
+                                        self._planned_path=np2; self._path_cursor=0
+                                        self.localizer.reset_cursor()
+
+                        if self.localizer.planner and self.localizer.is_initialized():
+                            xz,yz,_ = self.localizer.get_pose()
+                            mz = self.localizer.planner.get_zone(xz,yz)
+                            _zmf = _zmf+1 if mz!=t_res.zone_mode else 0
+                            if _zmf>=90 and self.traffic_engine:
+                                self.traffic_engine._zone_mode=mz; _zmf=0
+
+                        extra_offset = -80.0 if t_res.state=="SYS_LANE_CHANGE_LEFT" else 0.0
+
+                        if (self._planned_path and self.localizer.planner
+                                and 0<=self._path_cursor<len(self._planned_path)):
+                            node_now = self._planned_path[self._path_cursor]
+                            if self.localizer.planner.is_roundabout_node(node_now):
+                                if self._nav_state=="NORMAL": self._nav_state="ROUNDABOUT"
+                            elif self._nav_state=="ROUNDABOUT": self._nav_state="NORMAL"
+
+                        perc = self.vision.process(
+                            raw_frame,
+                            dt=dt,
+                            extra_offset_px=extra_offset,
+                            nav_state=self._nav_state,
+                            velocity_ms=velocity_ms,
+                            last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0),
+                            upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'))
+                        self._last_conf = perc.confidence; self._last_perc = perc
+
+                        self._nav_state = self.jct_detector.update(
+                            perc.warped_binary,perc.sl,perc.sr,perc.lane_width_px,t_res.active_labels)
+
+                        if self._nav_state=="JUNCTION_PROMPT":
+                            if self._planned_path and self.localizer.planner:
+                                xj,yj,yj2 = self.localizer.get_pose()
+                                action = self.localizer.planner.get_next_action(
+                                    xj,yj,yj2,path=self._planned_path,
+                                    cursor=self._path_cursor,velocity_ms=velocity_ms)
+                                self._nav_state = f"JUNCTION_{action}"
+                            else: self._nav_state="JUNCTION_STRAIGHT"
+
+                        self.localizer.update(
+                            velocity_ms=velocity_ms, dt=dt,
+                            camera_heading_rad=perc.heading_rad,
+                            camera_confidence=perc.confidence,
+                            heading_conf=perc.heading_conf,
+                            path=self._planned_path,
+                            optical_yaw_rate=perc.optical_yaw_rate,
+                            optical_vel=perc.optical_vel,
+                            current_steer_rad=math.radians(getattr(self._last_ctrl,'steer_angle_deg',0.0)))
+                        self._path_cursor = self.localizer.path_cursor
+
+                        # IMU correction runs AFTER dead-reckoning, not before.
+                        # This way IMU corrects the result of all layers, not just
+                        # the opening state that Layers 1-4 then override.
+                        imu_yaw = imu.read_yaw()
+                        self.localizer.update_imu_yaw(imu_yaw)
+
+                        self.localizer.get_upcoming_curve_from_path(
+                            self._planned_path,self._path_cursor,velocity_ms)
+
+                        ctrl = self.controller.compute(
+                            perc_res=perc, nav_state=self._nav_state,
+                            base_speed=float(self.base_speed),
+                            traffic_mult=self._traffic_mult_ema,   # smoothed, not raw
+                            velocity_ms=velocity_ms, dt=dt,
+                            map_curvature=map_curvature,
+                            upcoming_curve=upcoming_curve,
+                            curve_dist_m=curve_dist_m)
+
+                        # --- STARTUP CALIBRATION OVERRIDE ---
+                        # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
+                        # Stage 2 (3-6 s): crawl at ≤15 PWM — warm up EMA lane tracker.
+                        if not calibration_done:
+                            if elapsed_run < 3.0:
+                                ctrl.speed_pwm       = 0.0
+                                ctrl.steer_angle_deg = 0.0
+                                cv2.putText(perc.lane_dbg,
+                                    f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
+                                    (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                            elif elapsed_run < 6.0:
+                                ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
+                                cv2.putText(perc.lane_dbg,
+                                    f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
+                                    (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+
+                        safety.update_encoder()   # stamp encoder liveness each pilot frame
+                        ctrl.speed_pwm *= safety.safe_speed_override()
+
+                        self._last_ctrl = ctrl
+
+                        # Both lanes lost: count toward E-STOP
+                        _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
+                        if _ll >= _LLS:
+                            self.hw.set_speed(0); self.hw.set_steering(0)
+                            self._estop = True
+                        else:
+                            speed = ctrl.speed_pwm
+                            if _ll >= _LLC:
+                                speed = min(speed, 20.0)   # both lost: crawl
+
+                            # Single-lane-lost: sr gone (DIVIDER_FOLLOW or RL_FROM_EDGE stale)
+                            # Reduce to 70% of base to buy time for lane recovery.
+                            # sl visible alone is enough to trigger this.
+                            elif perc.sr is None and perc.sl is not None:
+                                speed = min(speed, ctrl.speed_pwm * 0.70)
+
+                            # Dead reckoning with decayed confidence: additional penalty
+                            if "DEAD_RECKONING" in perc.anchor:
+                                try:
+                                    dr_conf = float(perc.anchor.split("_")[2])
+                                except Exception:
+                                    dr_conf = 0.5
+                                if dr_conf < 0.5:   # only cut when confidence is low
+                                    speed = min(speed, ctrl.speed_pwm * 0.55)
+
+                            # Traffic Manager speed limit
+                            limit = None
+                            if hasattr(self, "tm") and self.tm:
+                                limit = self.tm.get_speed_limit(
+                                    self._path_cursor,
+                                    getattr(self.localizer, 'zone', 'CITY')
+                                )
+                            if limit is not None:
+                                speed = min(speed, limit)
+
+                            if 0.0 < speed < PWM_DEADBAND: speed = PWM_DEADBAND
+
+                            # Low-pass filter: smooth speed commands so jitter doesn't reach the motor
+                            if speed == 0.0:
+                                self._speed_ema = 0.0      # hard zero on E-STOP / stop commands
+                            else:
+                                self._speed_ema = (self._SPEED_EMA_ALPHA * speed
+                                                   + (1.0 - self._SPEED_EMA_ALPHA) * self._speed_ema)
+                                if self._speed_ema < PWM_DEADBAND:
+                                    self._speed_ema = PWM_DEADBAND
+
+                            self.hw.set_speed(self._speed_ema); self.hw.set_steering(ctrl.steer_angle_deg)
+
+                    # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
+                    yolo_frame = t_res.yolo_debug_frame if (t_res is not None and getattr(t_res, 'yolo_debug_frame', None) is not None) else raw_frame
+                    push_latest(self._q_yolo, yolo_frame)
+                    push_latest(self._q_bev, _annotate_bev(perc, ctrl))
+
+                    # VIZ-03: localization panel
+                    sm     = getattr(self.localizer,'_snap_miss_frames',0)
+                    lx,ly,lyaw = self.localizer.get_pose()
+                    yr     = self.localizer.visual_yaw_rate
+                    self._loc_panel.push(yr, perc.lateral_error_px, lx, ly, sm==0)
+                    vm_src_loc = self.hw.get_velocity_source()
+                    loc_img = self._loc_panel.render(
+                        x=lx, y=ly, yaw_deg=math.degrees(lyaw),
+                        yaw_rate=yr, heading_conf=perc.heading_conf,
+                        snap_miss=sm, confidence=perc.confidence,
+                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
+                        curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0),
+                        lat_err_px=perc.lateral_error_px, velocity_ms=velocity_ms,
+                        velocity_src=vm_src_loc,
+                        zone=self.localizer.current_zone, nav_state=self._nav_state,
+                        l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
+                        l2=bool(self._planned_path and perc.confidence>0.5),
+                        l4=sm<5,
+                        health=loc_data.get("health", {}),
+                        loc_data=loc_data)
+                    push_latest(self._q_loc, loc_img)
+
+                    # Root Cause C: render map in pilot thread to keep GUI at full 30Hz
+                    if self.localizer.is_initialized():
+                        snap_miss_m = getattr(self.localizer, '_snap_miss_frames', 0)
+                        hconf_raw_m = getattr(self.localizer, '_cam_yaw_smoothed', 0.0)
+                        conf_m = self._last_conf
+                        zone_m = self.localizer.current_zone
+                        map_img = self._map_renderer.render(
+                            lx, ly, lyaw,
+                            self._planned_path, self._path_cursor,
+                            self.localizer.planner, conf_m, zone_m,
+                            snap_miss=snap_miss_m,
+                            heading_conf=abs(hconf_raw_m) * 2.0)
+                        push_latest(self._q_map, map_img)
+
+                    elapsed = time.time()-ts
+                    time.sleep(max(0.001, FRAME_PERIOD-elapsed))
+                except Exception as e:
+                    log.error("Pilot error", exc_info=True)
+                    continue
 
         except Exception as e:
             log.error(f"FATAL Pilot crash: {e}", exc_info=True); self._estop=True
