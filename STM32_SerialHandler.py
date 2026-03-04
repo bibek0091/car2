@@ -2,7 +2,7 @@ import serial
 import time
 import threading
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict
 from enum import Enum
 
@@ -37,7 +37,7 @@ class VehicleStatus:
     instant_current: float = 0.0
     imu_data: Optional[Dict] = None
     last_heartbeat: float = 0.0
-    _speed_timestamp: float = 0.0   # time.time() of last encoder speed update
+    _speed_timestamp: float = field(default_factory=lambda: time.time())
 
 # ===================== MAIN CLASS =====================
 
@@ -214,6 +214,9 @@ class STM32_SerialHandler:
         val = val.strip()
         try:
             if cmd == "speed":
+                self.status.speed_mm_s    = float(val)
+                self.status._speed_timestamp = time.time()
+            elif cmd == "encoder":    # some BFMC firmware uses "encoder" not "speed"
                 self.status.speed_mm_s    = float(val)
                 self.status._speed_timestamp = time.time()
             elif cmd == "steer":

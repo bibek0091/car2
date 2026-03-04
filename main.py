@@ -1337,13 +1337,35 @@ class Orchestrator:
 
                     self._last_ctrl = ctrl
 
+                    # Both lanes lost: count toward E-STOP
                     _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
-                    if _ll>=_LLS:
+                    if _ll >= _LLS:
                         self.hw.set_speed(0); self.hw.set_steering(0)
-                        self._estop=True
+                        self._estop = True
                     else:
                         speed = ctrl.speed_pwm
-                        if _ll >= _LLC: speed = min(speed, 20.0)
+                        if _ll >= _LLC:
+                            speed = min(speed, 20.0)   # both lost: crawl
+
+                        # Single-lane-lost: sr gone (DIVIDER_FOLLOW or RL_FROM_EDGE stale)
+                        # Reduce to 70% of base to buy time for lane recovery.
+                        # sl visible alone is enough to trigger this.
+                        elif perc.sr is None and perc.sl is not None:
+                            speed = min(speed, ctrl.speed_pwm * 0.70)
+
+                        # Dead reckoning with decayed confidence: additional penalty
+                        if "DEAD_RECKONING" in perc.anchor:
+                            try:
+                                dr_conf = float(perc.anchor.split("_")[2])
+                            except Exception:
+                                dr_conf = 0.5
+                            if dr_conf < 0.5:   # only cut when confidence is low
+                                speed = min(speed, ctrl.speed_pwm * 0.55)
+
+                        # Traffic Manager speed limit
+                        limit = self.tm.get_speed_limit(self._path_cursor, getattr(self.localizer,'zone','CITY'))
+                        speed = min(speed, limit)
+
                         if 0.0 < speed < PWM_DEADBAND: speed = PWM_DEADBAND
 
                         # Low-pass filter: smooth speed commands so jitter doesn't reach the motor

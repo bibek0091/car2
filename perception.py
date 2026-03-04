@@ -119,7 +119,7 @@ class HybridLaneTracker:
     MIN_PIX_OK       = 200
     EMA_ALPHA        = 0.65   # F-12: base alpha (was 0.50 — too slow)
     EMA_ALPHA_TURN   = 0.85   # F-12: fast alpha when curvature is high
-    STALE_FIT_FRAMES = 5      # 167ms — brief occlusion ok, long ghost fit is dangerous
+    STALE_FIT_FRAMES = 5      # 167ms — enough for brief occlusion, not long ghost fits
 
     # ── Right-lane driving constants ──────────────────────────────────────────
     # In BFMC (drives on the right):
@@ -268,20 +268,21 @@ class HybridLaneTracker:
                     base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
                     anchor = "RL_DUAL"
             else:
-                # sr visible, sl not. Use fixed half-lane width (not stale EMA).
+                # sr visible, sl not. Use fixed half-lane estimate (not stale EMA width).
                 single_hw = self.SINGLE_LANE_PX / 2.0   # 200 / 2 = 100 px
                 base_x = ev(sr) - single_hw + self.RIGHT_LANE_BIAS_PX
-                # Graduated blend toward image centre when sr is stale.
-                # Prevents a frozen polynomial from jerking target on clearance.
+                # Graduated blend toward image centre as sr goes stale.
+                # Prevents the frozen polynomial position from causing a sudden
+                # jump when it is finally cleared at STALE_FIT_FRAMES.
                 if self.right_stale > 1:
                     blend = min(1.0, self.right_stale / float(self.STALE_FIT_FRAMES))
                     base_x = base_x * (1.0 - blend) + 320.0 * blend
                 anchor = "RL_FROM_EDGE"
         # ─ TIER 2: divider follow ────────────────────────────────────
         else:
-            # sr gone — shadow the centre divider from the right at a fixed offset.
-            # Floor clamp: never place target left of 290px (image near-centre).
-            # sl moves on curves; without clamp, target chases sl leftward.
+            # sr gone — target 155px right of centre divider.
+            # Floor clamp at 290px: sl drifts left on curves, without clamp
+            # the target chases sl and the car steers off the lane.
             base_x = max(ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX, 290.0)
             anchor = "DIVIDER_FOLLOW"
 
@@ -449,13 +450,16 @@ class VisionPipeline:
             velocity_ms, last_steering
         )
         
-        if target_x is None:
+        # get_target_x() never returns None — check anchor name instead.
+        # DEAD_RECKONING anchor = both lanes lost → accumulate lost time.
+        # Any other anchor = at least one lane visible → reset lost timer.
+        if anchor.startswith("DEAD_RECKONING"):
             self.lost_frames += 1
-            self.tracker.dead_reckoner.accumulate(dt)   # A-03: accumulate real time
-            target_x = self.last_target_x
+            self.tracker.dead_reckoner.accumulate(dt)   # now actually runs
         else:
             self.lost_frames = 0
             self.last_target_x = target_x
+            self.tracker.dead_reckoner.reset_lost_timer()
 
         # Confidence & Curvature Formatting
         curv = self.tracker.get_curvature(y_eval)
