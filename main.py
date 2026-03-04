@@ -1,1544 +1,212 @@
 """
-main.py — BFMC Single-Window Autonomous Pilot  (v4 — VISUALIZATION OVERHAUL)
-=============================================================================
-VISUALIZATION UPGRADES in v4:
-
-  VIZ-01  LIVE POSE TRAIL on SVG map: rolling deque of last 200 (x,y) drawn
-          as a colour-gradient trail (bright cyan=recent, faded blue=old).
-
-  VIZ-02  UNCERTAINTY ELLIPSE around car dot: radius proportional to
-          snap_miss_frames. Green=snapped, amber=drifting, red=lost.
-
-  VIZ-03  DEDICATED LOCALIZATION PANEL (520×400):
-          - Large X/Y/YAW readout with quality colour coding
-          - Yaw-rate sparkline (80 frames)
-          - Lateral error sparkline
-          - Layer status badges (L1=yaw-rate, L2=path-nudge, L3=dead-reck, L4=snap)
-          - Heading confidence bar
-          - Snap status + miss count
-          - Dead-reckoning distance since last snap
-          - Upcoming curve + distance indicator
-
-  VIZ-04  ENHANCED TELEMETRY PANEL:
-          - 180° semicircle steering gauge with tick marks at 0,±15,±30,±45°
-          - Speed shows PWM + m/s side by side
-          - Separate L/R lane confidence bars
-          - Curvature display + nav state
-
-  VIZ-05  GRAPHML PANEL UPGRADED:
-          - Roundabout nodes=teal, junction nodes=yellow
-          - Active segment highlighted bright orange (width=3)
-          - Lookahead circle radius drawn around cursor node
-          - Gradient: green=done, orange→red=ahead
-
-  VIZ-06  BEV PANEL UPGRADED:
-          - Dashed target crosshair
-          - y_eval row pulsed with anchor colour
-          - Curvature arc drawn in pink
-          - Lane-width dimension annotation
-
-  VIZ-07  STATUS BAR across full window top:
-          - E-STOP/RUNNING, FPS, Zone, NavState, UpcomingCurve, SnapMiss
-
-  VIZ-08  MAP heading-confidence arc + numbered lookahead waypoint label
-
-Fixes from v3 all retained (MAIN-01 to MAIN-05).
+main.py — Vision + IMU Autonomous Pilot (Simplified Dashboard)
+===========================================================================
+- Removed: Tkinter GUI, map_planner, localization, graph logic.
+- Added: IMU Yaw Rate differentiation for Electronic Stability Control.
+- Added: Clean, high-performance OpenCV telemetry dashboard.
+- Strictly uses right-lane tracking and divider forcefields.
 """
 
-import argparse
-import logging
-import math
-import os
-import sys
-import threading
-import time
-import queue
-from collections import deque
-
 import cv2
+import time
+import math
 import numpy as np
-import tkinter as tk
-from PIL import Image, ImageTk
+import logging
+import argparse
 
-from perception    import VisionPipeline
-from localization  import LocalizationEngine
-from control       import Controller, ControlOutput
-from hardware_io   import HardwareIO
-from bno055_imu    import BNO055_IMU
+# Hardware & Subsystems
+from perception import VisionPipeline
+from control import Controller
+from safety import SafetySupervisor
+
+# Graceful hardware fallbacks
+try:
+    from STM32_SerialHandler import STM32_SerialHandler
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    _SERIAL_AVAILABLE = False
+    class STM32_SerialHandler:
+        def connect(self): return False
+        def send_command(self, cmd, val): pass
+        def disconnect(self): pass
 
 try:
-    from traffic_module import TrafficDecisionEngine, ThreadedYOLODetector, TrafficResult
-    _TRAFFIC_AVAILABLE = True
+    from bno055_imu import BNO055_IMU
+    _IMU_AVAILABLE = True
 except ImportError:
-    _TRAFFIC_AVAILABLE = False
-    from dataclasses import dataclass, field
-    from typing import List
-
-    @dataclass
-    class TrafficResult:
-        state:               str   = "SYS_GO"
-        reason:              str   = "NO TRAFFIC MODULE"
-        speed_multiplier:    float = 1.0
-        zone_mode:           str   = "CITY"
-        parking_state:       str   = "NONE"
-        steer_bias:          float = 0.0
-        pedestrian_blocking: bool  = False
-        light_status:        str   = "NONE"
-        active_labels:       List  = field(default_factory=list)
-        yolo_debug_frame:    object = None
-
-    class ThreadedYOLODetector:
-        def __init__(self, *a, **kw): pass
-        def stop(self): pass
-
-    class TrafficDecisionEngine:
-        def __init__(self, *a, **kw): pass
-        def process(self, frame, *a, **kw):
-            return TrafficResult(yolo_debug_frame=frame.copy())
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("main")
-
-TARGET_FPS   = 30
-FRAME_PERIOD = 1.0 / TARGET_FPS
-PWM_DEADBAND = 12.0   # must match HardwareIO.DEADBAND_PWM exactly
-_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-SVG_PATH_DEFAULT = os.path.join(_SCRIPT_DIR, "Track.svg")
-MAP_W_M = 22.0
-MAP_H_M = 15.0
-
-# BGR colours
-C_CYAN  = (255, 230,   0)
-C_GREEN = ( 50, 220,  50)
-C_AMBER = ( 50, 190, 255)
-C_RED   = ( 50,  50, 230)
-C_WHITE = (230, 230, 230)
-C_DGRAY = ( 55,  55,  55)
-C_BG    = ( 18,  18,  18)
-
-
-def map_to_pixel(x_m, y_m, img_w, img_h, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
-    return int(x_m / map_w_m * img_w), int((map_h_m - y_m) / map_h_m * img_h)
-
-def pixel_to_map(px, py, img_w, img_h, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
-    return px / img_w * map_w_m, (1.0 - py / img_h) * map_h_m
-
-
-def push_latest(q, item):
-    """Forcefully pushes the newest frame, dropping the oldest if full."""
-    if q.full():
-        try:
-            q.get_nowait()
-        except queue.Empty:
-            pass
-    q.put(item)
-
-
-def _load_svg_as_cv2(svg_path, display_w=600, display_h=440):
-    try:
-        import cairosvg
-        arr = np.frombuffer(
-            cairosvg.svg2png(url=svg_path, output_width=display_w, output_height=display_h),
-            np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is not None: return img
-    except Exception: pass
-    try:
-        from svglib.svglib import svg2rlg
-        from reportlab.graphics import renderPM
-        img = renderPM.drawToPIL(svg2rlg(svg_path))
-        img = img.convert("RGB").resize((display_w, display_h), Image.LANCZOS)
-        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    except Exception: pass
-    blank = np.full((display_h, display_w, 3), 30, np.uint8)
-    cv2.putText(blank, "SVG unavailable — pip install cairosvg",
-                (12, display_h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150,150,150), 1)
-    return blank
-
-
-# ── Drawing primitives ────────────────────────────────────────────────────────
-
-def _lbl(img, txt, x, y, scale=0.38, color=C_WHITE, t=1):
-    cv2.putText(img, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, t, cv2.LINE_AA)
-
-def _badge(img, txt, x, y, color, w=None):
-    tw = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)[0][0]
-    bw = w or tw + 10
-    cv2.rectangle(img, (x, y-15), (x+bw, y+4), color, -1, cv2.LINE_AA)
-    cv2.putText(img, txt, (x+4, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0,0,0), 1, cv2.LINE_AA)
-
-def _hbar(img, val, maxv, x, y, w, h, color):
-    cv2.rectangle(img, (x, y), (x+w, y+h), C_DGRAY, -1)
-    fill = int(np.clip(abs(val)/max(abs(maxv),1e-6), 0, 1)*w)
-    cv2.rectangle(img, (x, y), (x+fill, y+h), color, -1)
-
-def _spark(img, vals, x, y, w, h, color, scale=None):
-    if len(vals) < 2: return
-    arr = np.array(list(vals), dtype=float)
-    if scale is None:
-        mn, mx = arr.min(), arr.max(); rng = max(mx-mn, 1e-6)
-    else:
-        mn, mx, rng = -scale, scale, 2*scale
-    cv2.rectangle(img, (x, y), (x+w, y+h), (28,28,28), -1)
-    zy = y+h - int((-mn)/rng*h)
-    cv2.line(img, (x, zy), (x+w, zy), (55,55,55), 1)
-    pts = []
-    for i, v in enumerate(arr):
-        px_ = x + int(i/max(len(arr)-1,1)*w)
-        py_ = y+h - int(np.clip((v-mn)/rng, 0, 1)*h)
-        pts.append([px_, py_])
-    cv2.polylines(img, [np.array(pts,dtype=np.int32)], False, color, 1, cv2.LINE_AA)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIZ-01/02/08 — MapOverlayRenderer
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MapOverlayRenderer:
-    TRAIL_LEN = 200
-
-    def __init__(self, svg_bgr, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
-        self.base = svg_bgr.copy()
-        self.w_m, self.h_m = map_w_m, map_h_m
-        self.ih, self.iw = svg_bgr.shape[:2]
-        self._trail = deque(maxlen=self.TRAIL_LEN)
-
-    def _w2p(self, x, y):
-        return map_to_pixel(x, y, self.iw, self.ih, self.w_m, self.h_m)
-
-    def add_trail_point(self, x, y):
-        self._trail.append((x, y))
-
-    def render(self, x, y, yaw, path, cursor, planner, conf, zone,
-               snap_miss=0, heading_conf=0.0):
-        img = self.base.copy()
-
-        # Planned path
-        if path and planner:
-            pts_all, pts_done = [], []
-            for i, n in enumerate(path):
-                pos = planner.node_positions.get(n)
-                if pos:
-                    pts_all.append(list(self._w2p(*pos)))
-                    if i <= cursor: pts_done.append(list(self._w2p(*pos)))
-            if len(pts_all) > 1:
-                cv2.polylines(img,[np.array(pts_all,np.int32)],False,(120,40,170),2,cv2.LINE_AA)
-            if len(pts_done) > 1:
-                cv2.polylines(img,[np.array(pts_done,np.int32)],False,(40,160,40),2,cv2.LINE_AA)
-            # VIZ-08: numbered lookahead waypoint
-            la_idx = min(cursor+5, len(path)-1)
-            la_pos = planner.node_positions.get(path[la_idx])
-            if la_pos:
-                lx, ly = self._w2p(*la_pos)
-                cv2.drawMarker(img,(lx,ly),(0,255,180),cv2.MARKER_CROSS,12,2,cv2.LINE_AA)
-                _lbl(img, f"+{la_idx-cursor}", lx+4, ly-4, scale=0.30, color=(0,255,180))
-
-        # VIZ-01: faded trail
-        trail = list(self._trail)
-        for i, (tx, ty) in enumerate(trail):
-            frac  = i / max(len(trail)-1, 1)
-            alpha = int(40 + frac*200)
-            px_, py_ = self._w2p(tx, ty)
-            cv2.circle(img, (px_,py_), max(1,int(1+frac*2)),
-                       (int(alpha*.5), int(alpha*.7), alpha), -1, cv2.LINE_AA)
-
-        # Car dot
-        cx, cy = self._w2p(x, y)
-        cx = max(6, min(self.iw-6, cx)); cy = max(6, min(self.ih-6, cy))
-        dot_col = C_CYAN if conf>0.6 else (C_AMBER if conf>0.3 else C_RED)
-
-        # VIZ-02: uncertainty ellipse
-        miss = min(snap_miss, 60)
-        r_u  = 6 + int(miss*0.75)
-        uc   = (50,160,50) if miss<5 else ((50,130,180) if miss<20 else (50,50,200))
-        cv2.ellipse(img,(cx,cy),(r_u,max(4,r_u//2)),
-                    int(math.degrees(yaw)),0,360,uc,1,cv2.LINE_AA)
-
-        # VIZ-08: heading-confidence arc
-        if heading_conf > 0.05:
-            arc_span = int(heading_conf * 180)
-            cv2.ellipse(img,(cx,cy),(14,14),
-                        int(math.degrees(yaw)-90),0,arc_span,(180,180,80),2,cv2.LINE_AA)
-
-        cv2.circle(img,(cx,cy), 9, dot_col, -1, cv2.LINE_AA)
-        cv2.circle(img,(cx,cy),13, dot_col,  1, cv2.LINE_AA)
-        hx = cx + int(math.cos(yaw)*22); hy = cy - int(math.sin(yaw)*22)
-        cv2.arrowedLine(img,(cx,cy),(hx,hy),C_WHITE,2,tipLength=0.4,line_type=cv2.LINE_AA)
-
-        # Movement vector: average direction of last 5 trail points
-        # This is the ACTUAL travel direction, independent of estimated yaw.
-        trail_pts = list(self._trail)
-        if len(trail_pts) >= 6:
-            recent = trail_pts[-6:]
-            dx_t = recent[-1][0] - recent[0][0]
-            dy_t = recent[-1][1] - recent[0][1]
-            dist  = math.hypot(dx_t, dy_t)
-            if dist > 0.02:   # only draw if car actually moved >= 2 cm
-                mv_yaw = math.atan2(dy_t, dx_t)
-                mvx = cx + int(math.cos(mv_yaw) * 18)
-                mvy = cy - int(math.sin(mv_yaw) * 18)   # flip y for pixel space
-                cv2.arrowedLine(img, (cx, cy), (mvx, mvy),
-                                (0, 255, 180), 2, tipLength=0.5,
-                                line_type=cv2.LINE_AA)
-                # Yaw drift indicator: if movement direction differs > 15° from yaw arrow,
-                # draw a red arc between them to make drift visible
-                drift_deg = abs(math.degrees(
-                    (mv_yaw - yaw + math.pi) % (2 * math.pi) - math.pi))
-                if drift_deg > 15.0:
-                    arc_col = (50, 50, 200) if drift_deg < 30 else (50, 50, 255)
-                    cv2.ellipse(img, (cx, cy), (20, 20),
-                                int(math.degrees(min(yaw, mv_yaw))),
-                                0, int(drift_deg), arc_col, 2, cv2.LINE_AA)
-
-        # Zone badge
-        zc = {"CITY":(40,110,40),"HIGHWAY":(160,70,20),"PARKING":(30,90,150)}.get(zone,(80,80,80))
-        _badge(img, zone, self.iw-86, 22, zc, w=82)
-
-        # Progress bar
-        if path:
-            prog = cursor / max(len(path)-1, 1)
-            bw   = int(self.iw * prog)
-            cv2.rectangle(img,(0,self.ih-8),(self.iw,self.ih),(25,25,25),-1)
-            cv2.rectangle(img,(0,self.ih-8),(bw,self.ih),(0,170,80),-1)
-            _lbl(img, f"{cursor}/{len(path)}  {prog*100:.0f}%",
-                 4, self.ih-11, scale=0.32)
-        # ── MERGED GRAPH OVERLAY ──────────────────────────────────────────────
-        # GraphML drawn on top of SVG so roads show through.
-        if getattr(self, '_graph_renderer', None) is not None:
-            img = self._graph_renderer.render_on(
-                img, path or [], cursor, None,
-                velocity_ms=0.3, alpha=0.80)
-        # ──────────────────────────────────────────────────────────────────────
-
-        return img
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIZ-05 — GraphMLRenderer
-# ══════════════════════════════════════════════════════════════════════════════
-
-class GraphMLRenderer:
-    def __init__(self, planner, canvas_w=600, canvas_h=440,
-                 map_w_m=MAP_W_M, map_h_m=MAP_H_M):
-        self.planner   = planner
-        self.W, self.H = canvas_w, canvas_h
-        self.map_w_m   = map_w_m
-        self.map_h_m   = map_h_m
-        self._jct_nodes = set()
-        if not planner or not planner.node_positions:
-            return
-        for nid in planner.graph.nodes():
-            if planner.is_at_junction(nid):
-                self._jct_nodes.add(nid)
-
-    def _p(self, x, y):
-        """Use SAME coordinate system as MapOverlayRenderer — global map_to_pixel()."""
-        return map_to_pixel(x, y, self.W, self.H, self.map_w_m, self.map_h_m)
-
-    def render_on(self, base_img, path, cursor, nearest_node,
-                  velocity_ms=0.3, alpha=0.75):
-        """
-        Draw the GraphML overlay ONTO base_img (the SVG map image).
-        Uses semi-transparent lines so the SVG road markings show through.
-        Returns the composited image.
-        """
-        if not self.planner:
-            return base_img
-
-        overlay = base_img.copy()
-
-        # Draw all graph edges (dim, so SVG roads stay visible)
-        for u, v, d in self.planner.graph.edges(data=True):
-            p1 = self.planner.node_positions.get(u)
-            p2 = self.planner.node_positions.get(v)
-            if not p1 or not p2:
-                continue
-            col = (50, 30, 80) if not d.get('dotted') else (35, 20, 55)
-            cv2.line(overlay, self._p(*p1), self._p(*p2), col, 1, cv2.LINE_AA)
-
-        # Draw all graph nodes (small, colour-coded)
-        for nid, (x, y) in self.planner.node_positions.items():
-            col = ((0, 180, 180) if nid in self.planner._roundabout_nodes else
-                   (160, 140, 0) if nid in self._jct_nodes else (60, 60, 80))
-            cv2.circle(overlay, self._p(x, y), 2, col, -1)
-
-        # Draw planned path on top
-        for i in range(len(path) - 1):
-            p1 = self.planner.node_positions.get(path[i])
-            p2 = self.planner.node_positions.get(path[i + 1])
-            if not p1 or not p2:
-                continue
-            if i < cursor:
-                col, thick = (30, 140, 30), 1
-            elif i == cursor:
-                col, thick = (0, 230, 255), 3
-            else:
-                frac = min((i - cursor) / max(len(path) - cursor, 1), 1.0)
-                col  = (30, int(200 * (1 - frac)), int(210 * frac))
-                thick = 2
-            cv2.line(overlay, self._p(*p1), self._p(*p2), col, thick, cv2.LINE_AA)
-
-        # Lookahead marker
-        if 0 <= cursor < len(path):
-            pos = self.planner.node_positions.get(path[cursor])
-            if pos:
-                la_px = int(max(2.5, velocity_ms * 6.0) / self.map_w_m * self.W)
-                cv2.circle(overlay, self._p(*pos), la_px, (45, 45, 90), 1, cv2.LINE_AA)
-                cv2.circle(overlay, self._p(*pos), 7, (210, 60, 210), -1, cv2.LINE_AA)
-
-        # Nearest node highlight
-        if nearest_node and nearest_node in self.planner.node_positions:
-            cv2.circle(overlay,
-                       self._p(*self.planner.node_positions[nearest_node]),
-                       6, C_WHITE, 1, cv2.LINE_AA)
-
-        # Blend overlay onto base so SVG shows through
-        result = cv2.addWeighted(overlay, alpha, base_img, 1.0 - alpha, 0)
-
-        # Legend (drawn AFTER blend so it's fully opaque)
-        _lbl(result, "[cyan=rbt  yellow=jct  cyan_line=active]",
-             4, self.H - 6, scale=0.28, color=(90, 90, 110))
-        return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIZ-03 — Localization Panel
-# ══════════════════════════════════════════════════════════════════════════════
-
-class LocalizationPanel:
-    HIST = 80
-
-    def __init__(self, w=520, h=400):
-        self.W, self.H = w, h
-        self._yr_hist  = deque(maxlen=self.HIST)
-        self._le_hist  = deque(maxlen=self.HIST)
-        self._x_hist   = deque(maxlen=self.HIST)
-        self._y_hist   = deque(maxlen=self.HIST)
-        self._dr_dist  = 0.0
-
-    def push(self, yaw_rate, lat_err, x, y, snap_active):
-        self._yr_hist.append(yaw_rate)
-        self._le_hist.append(lat_err)
-        if len(self._x_hist) >= 1 and not snap_active:
-            dx = x - (self._x_hist[-1] if self._x_hist else x)
-            dy = y - (self._y_hist[-1] if self._y_hist else y)
-            self._dr_dist += math.hypot(dx, dy)
-        else:
-            if snap_active: self._dr_dist = 0.0
-        self._x_hist.append(x); self._y_hist.append(y)
-
-    def render(self, x, y, yaw_deg, yaw_rate, heading_conf, snap_miss,
-               confidence, upcoming_curve, curve_dist_m, lat_err_px,
-               velocity_ms, velocity_src, zone, nav_state, l1, l2, l4, health,
-               loc_data=None):
-        if loc_data is None: loc_data = {}
-        img = np.full((self.H, self.W, 3), 18, np.uint8)
-
-        if not loc_data.get("initialized", False):
-            cv2.rectangle(img, (0, 0), (self.W, self.H), (18, 18, 18), -1)
-            cv2.putText(img, "LOCALIZER NOT INITIALIZED",
-                        (20, self.H // 2 - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 180, 255), 2)
-            cv2.putText(img, "Click start position on map",
-                        (35, self.H // 2 + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1)
-            return img
-
-        # Title
-        cv2.rectangle(img,(0,0),(self.W,28),(28,28,44),-1)
-        _lbl(img, "LOCALIZATION ENGINE — LIVE TELEMETRY",
-             8, 18, scale=0.48, color=(150,150,220), t=1)
-
-        # Pose readout
-        pc = C_GREEN if confidence>0.6 else (C_AMBER if confidence>0.3 else C_RED)
-        cv2.putText(img,f"X: {x:+8.3f} m",(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.68,pc,2,cv2.LINE_AA)
-        cv2.putText(img,f"Y: {y:+8.3f} m",(10,90),cv2.FONT_HERSHEY_SIMPLEX,0.68,pc,2,cv2.LINE_AA)
-        cv2.putText(img,f"YAW: {yaw_deg:+7.1f}\u00b0",(10,120),cv2.FONT_HERSHEY_SIMPLEX,0.68,pc,2,cv2.LINE_AA)
-        src_c = (50,220,50) if velocity_src == "ENCODER" else (50,180,255)
-        _lbl(img,
-             f"v={velocity_ms:.3f}m/s [{velocity_src}]   zone={zone}   nav={nav_state}",
-             10, 140, scale=0.37, color=src_c)
-
-        # Yaw-rate sparkline
-        _lbl(img,"YAW-RATE (rad/s)",8,162,scale=0.35,color=(130,130,180))
-        _spark(img,self._yr_hist,8,165,self.W-16,50,(60,190,255),scale=1.2)
-        yrc = C_GREEN if abs(yaw_rate)<0.3 else (C_AMBER if abs(yaw_rate)<0.8 else C_RED)
-        _lbl(img,f"{yaw_rate:+.3f}r/s",self.W-90,206,scale=0.40,color=yrc)
-
-        # Lateral error sparkline
-        _lbl(img,"LATERAL ERROR (px)",8,230,scale=0.35,color=(130,180,130))
-        _spark(img,self._le_hist,8,233,self.W-16,42,(60,220,60),scale=160.0)
-        lec = C_GREEN if abs(lat_err_px)<30 else (C_AMBER if abs(lat_err_px)<70 else C_RED)
-        _lbl(img,f"{lat_err_px:+.1f}px",self.W-80,267,scale=0.40,color=lec)
-
-        # Layer badges
-        _lbl(img,"LAYERS:",8,292,scale=0.38,color=(130,130,155))
-        bx = 68
-        for name, active in [("L1:YAW",l1),("L2:PATH",l2),("L3:DR",True),("L4:SNAP",l4)]:
-            col = (35,145,35) if active else (35,35,95)
-            tw  = cv2.getTextSize(name,cv2.FONT_HERSHEY_SIMPLEX,0.34,1)[0][0]
-            cv2.rectangle(img,(bx,279),(bx+tw+8,296),col,-1,cv2.LINE_AA)
-            _lbl(img,name,bx+4,292,scale=0.34,color=(0,0,0))
-            bx += tw+14
-
-        # Heading confidence bar
-        hcc = C_GREEN if heading_conf>0.5 else (C_AMBER if heading_conf>0.25 else C_RED)
-        _lbl(img,f"HEADING CONF: {heading_conf:.2f}",8,316,scale=0.37,color=(170,170,110))
-        _hbar(img,heading_conf,1.0,8,319,self.W-16,10,hcc)
-
-        # Map snap status
-        snc = C_GREEN if snap_miss<5 else (C_AMBER if snap_miss<20 else C_RED)
-        _lbl(img,
-             f"MAP SNAP: {'ACTIVE' if snap_miss<5 else 'LOST'} ({snap_miss} misses)",
-             8,346,scale=0.38,color=snc)
-
-        # DR distance
-        drc = C_GREEN if self._dr_dist<0.3 else (C_AMBER if self._dr_dist<1.0 else C_RED)
-        _lbl(img,f"DR DIST: {self._dr_dist:.3f} m since snap",8,362,scale=0.37,color=drc)
-
-        # Upcoming curve
-        cc = C_GREEN if upcoming_curve=="STRAIGHT" else (C_AMBER if "LEFT" in upcoming_curve else C_RED)
-        ds = f"{curve_dist_m:.1f}m" if curve_dist_m<99 else "---"
-        _lbl(img,f"CURVE: {upcoming_curve}  @{ds}",self.W//2,346,scale=0.42,color=cc)
-
-        # Confidence mini bar
-        _lbl(img,f"CONF: {confidence:.2f}",self.W//2,362,scale=0.37,color=pc)
-        _hbar(img,confidence,1.0,self.W//2,365,self.W//2-10,10,pc)
-
-        # Sensor health summary bar
-        _lbl(img, "SENSOR HEALTH:", 8, 385, scale=0.35, color=(130,130,155))
-        for i, (label, key) in enumerate([("IMU",  "imu"),
-                                           ("CAM",  "cam"),
-                                           ("SNAP", "snap")]):
-            val = health.get(key, 0.0)
-            hc  = (50,200,50) if val>0.7 else ((50,180,200) if val>0.3 else (50,50,200))
-            bx_ = 8 + i * 120
-            _lbl(img, f"{label}: {val:.0%}", bx_, 400, scale=0.34, color=hc)
-            _hbar(img, val, 1.0, bx_, 402, 108, 7, hc)
-
-        # DEAD-RECKONING WARNING if all sensors lost
-        overall = health.get("overall", 1.0)
-        if overall < 0.25:
-            cv2.rectangle(img, (0, img.shape[0]-30), (img.shape[1], img.shape[0]),
-                          (0, 0, 160), -1)
-            _lbl(img, "⚠ ALL SENSORS LOST — DEAD RECKONING",
-                 8, img.shape[0]-10, scale=0.42, color=(200,200,50))
-
-        return img
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIZ-04 — Telemetry panel
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _steer_gauge(img, steer, cx, cy, r):
-    cv2.ellipse(img,(cx,cy),(r,r),0,180,360,(45,45,45),10)
-    for td in [-45,-30,-15,0,15,30,45]:
-        ang = math.radians(270-(td/45.0)*90)
-        oi  = (cx+int(r*math.cos(ang)),   cy+int(r*math.sin(ang)))
-        ii  = (cx+int((r-8)*math.cos(ang)),cy+int((r-8)*math.sin(ang)))
-        cv2.line(img,ii,oi,(75,75,75) if td!=0 else (110,110,110),
-                 1 if td!=0 else 2, cv2.LINE_AA)
-    ang = math.radians(270-(steer/45.0)*90)
-    nx  = int(cx+r*math.cos(ang)); ny = int(cy+r*math.sin(ang))
-    col = C_GREEN if abs(steer)<15 else (C_AMBER if abs(steer)<30 else C_RED)
-    cv2.line(img,(cx,cy),(nx,ny),col,3,cv2.LINE_AA)
-    cv2.circle(img,(cx,cy),5,col,-1,cv2.LINE_AA)
-    _lbl(img,f"{steer:+.1f}\u00b0",cx-24,min(cy+r+18,img.shape[0]-4),scale=0.44,color=col)
-    _lbl(img,"STEER",cx-18,max(cy-r-6,12),scale=0.37,color=(120,120,120))
-
-
-def _draw_telemetry_panel(steer, speed_pwm, lat_err, conf, anchor,
-                          zone, upcoming_curve, fps, sign_history,
-                          nav_state, l_conf, r_conf, curvature,
-                          velocity_ms, velocity_src="?", w=560, h=480):
-    img = np.full((h,w,3),18,np.uint8)
-    cv2.rectangle(img,(0,0),(w,28),(28,28,40),-1)
-    _lbl(img,"TELEMETRY",8,18,scale=0.48,color=(160,160,220),t=1)
-
-    _steer_gauge(img, steer, cx=100, cy=108, r=78)
-
-    _lbl(img,f"PWM:{speed_pwm:.0f}  v={velocity_ms:.3f}m/s",200,52,scale=0.38,color=(130,175,220))
-    _hbar(img,speed_pwm,100,200,55,w-210,12,(50,135,220))
-
-    lec = C_GREEN if abs(lat_err)<30 else (C_AMBER if abs(lat_err)<70 else C_RED)
-    _lbl(img,f"LAT ERR: {lat_err:+.1f}px",200,83,scale=0.38,color=lec)
-    _hbar(img,lat_err,160,200,86,w-210,12,lec)
-
-    cc = C_GREEN if conf>0.6 else (C_AMBER if conf>0.3 else C_RED)
-    _lbl(img,f"LANE CONF: {conf:.2f}",200,113,scale=0.38,color=cc)
-    _hbar(img,conf,1.0,200,116,w-210,12,cc)
-
-    hw = (w-210)//2 - 4
-    _lbl(img,f"L:{l_conf:.2f}",200,142,scale=0.34,color=(180,90,90))
-    _hbar(img,l_conf,1.0,200,145,hw,9,(175,75,75))
-    _lbl(img,f"R:{r_conf:.2f}",200+hw+6,142,scale=0.34,color=(80,95,190))
-    _hbar(img,r_conf,1.0,200+hw+6,145,hw,9,(75,90,185))
-
-    ac = C_GREEN if "DUAL" in anchor else (C_AMBER if "DEAD" not in anchor else C_RED)
-    _lbl(img,f"ANCHOR: {anchor}",200,167,scale=0.38,color=ac)
-
-    curvc = C_GREEN if curvature<0.001 else (C_AMBER if curvature<0.003 else C_RED)
-    _lbl(img,f"CURV: {curvature:.5f}",200,185,scale=0.37,color=curvc)
-
-    fpsc = C_GREEN if fps>=25 else (C_AMBER if fps>=18 else C_RED)
-    _lbl(img, f"LOOP: {fps:.1f} Hz" + ("  !! LOW" if fps < 18 else "  OK"), 200, 207, scale=0.44, color=fpsc)
-
-    # Explicit m/s speed readout in large text so it is always readable at a glance
-    cv2.line(img, (195, 260), (w-10, 260), (40, 40, 40), 1)
-    src_col = (50, 220, 50) if velocity_src == "ENCODER" else (50, 180, 255)
-    src_txt = "ENC" if velocity_src == "ENCODER" else "EST"
-    cv2.putText(img, f"{velocity_ms:.3f} m/s", (200, 310),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.80, src_col, 2, cv2.LINE_AA)
-    _lbl(img, f"VEHICLE SPEED  [{src_txt}]", 200, 295,
-         scale=0.34, color=src_col)
-    # If estimating, show a small warning badge
-    if velocity_src != "ENCODER":
-        _badge(img, "NO ENCODER", 200, 330, (30, 30, 160), w=90)
-
-    nc = C_GREEN if nav_state=="NORMAL" else (C_AMBER if "JUNCTION" in nav_state else C_CYAN)
-    _lbl(img,f"NAV: {nav_state}",200,227,scale=0.37,color=nc)
-
-    ucc = C_GREEN if upcoming_curve=="STRAIGHT" else (C_AMBER if "LEFT" in upcoming_curve else C_RED)
-    _lbl(img,f"NEXT: {upcoming_curve}",200,247,scale=0.42,color=ucc)
-
-    _lbl(img,"DETECTIONS:",8,232,scale=0.35,color=(90,90,115))
-    now_ = time.time()
-    for i,(lbl,cf,ts) in enumerate(sign_history[-5:]):
-        age = now_-ts; alpha=max(0.15,1.0-age/5.0); c=int(200*alpha)
-        _lbl(img,f"{lbl} ({age:.1f}s)",8,248+i*18,scale=0.33,color=(c,c,c))
-
-    return img
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIZ-06 — BEV annotation
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _annotate_bev(perc, ctrl):
-    if perc is None:
-        return np.zeros((480, 640, 3), np.uint8)
-    dbg = perc.lane_dbg.copy() if perc.lane_dbg is not None \
-          else np.zeros((480, 640, 3), np.uint8)
-    h, w = dbg.shape[:2]   # use actual dimensions, not hardcoded
-    if perc.warped_binary is not None and not perc.warped_binary.any():
-        cv2.putText(dbg, "BEV: ZERO WHITE PIXELS — CHECK SRC_PTS CALIBRATION",
-                    (10, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1)
-
-    def draw_poly(fit, color):
-        if fit is None: return
-        ys  = np.linspace(40, h-1, 240).astype(np.float32)
-        xs  = np.clip(np.polyval(fit, ys), 0, w-1).astype(np.float32)
-        pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2).astype(np.int32)
-        cv2.polylines(dbg, [pts], False, color, 3, cv2.LINE_AA)
-
-    draw_poly(perc.sl,(255,80,80))
-    draw_poly(perc.sr,(80,80,255))
-
-    # Lane width annotation
-    if perc.sl is not None and perc.sr is not None:
-        lx = int(np.clip(np.polyval(perc.sl, h*5//6), 0, w-1))
-        rx = int(np.clip(np.polyval(perc.sr, h*5//6), 0, w-1))
-        row = h*5//6
-        cv2.line(dbg, (lx, row), (rx, row), (70,170,70), 1, cv2.LINE_AA)
-        _lbl(dbg, f"w={perc.lane_width_px:.0f}px", (lx+rx)//2-20, row-4, scale=0.34, color=(70,170,70))
-
-    # y_eval dashed row
-    yrow = int(perc.y_eval)
-    yc   = C_GREEN if "DUAL" in ctrl.anchor else (C_AMBER if "DEAD" not in ctrl.anchor else C_RED)
-    for xi in range(0, w, 18): cv2.line(dbg, (xi, yrow), (xi+9, yrow), yc, 1, cv2.LINE_AA)
-
-    # Target dashed crosshair
-    tx = max(4, min(w-4, int(ctrl.target_x)))
-    for yi in range(h*3//4, h*11//12, 12): cv2.line(dbg, (tx,yi), (tx,yi+6), (0,255,255), 2, cv2.LINE_AA)
-    cv2.line(dbg, (tx-12, yrow), (tx+12, yrow), (0,255,255), 2, cv2.LINE_AA)
-
-    # Curvature arc
-    curv = perc.curvature
-    if curv > 1e-5:
-        R = min(int(1.0/curv),1400)
-        if R < 700:
-            sign = 1 if (perc.sl is not None and perc.sl[0]>0) else -1
-            cv2.ellipse(dbg,(tx+sign*R,400),(R,R),0,84,96,(190,70,170),2,cv2.LINE_AA)
-
-    _lbl(dbg,ctrl.anchor,10,25,scale=0.50,color=C_WHITE)
-    _lbl(dbg,f"steer={ctrl.steer_angle_deg:+.1f}  la={ctrl.lookahead_px:.0f}px",10,50,scale=0.44,color=(70,225,70))
-    _lbl(dbg,f"conf={perc.confidence:.2f}  curv={perc.curvature:.5f}",10,72,scale=0.37,color=(150,150,150))
-    return dbg
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIZ-07 — Status bar
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _status_bar(w, estop, fps, zone, nav_state, upcoming_curve, curve_dist_m,
-                conf, snap_miss):
-    img = np.full((32, w, 3), 28, np.uint8)
-    _badge(img," E-STOP " if estop else " RUNNING ",4,22,
-           (0,0,170) if estop else (30,120,30), w=76)
-    _badge(img, f" {fps:.0f}Hz ", 90, 22,
-           (30,120,30) if fps>=25 else ((30,100,160) if fps>=18 else (0,0,160)), w=62)
-    zc = {"CITY":(40,100,40),"HIGHWAY":(130,55,20),"PARKING":(25,80,140)}.get(zone,(60,60,60))
-    _badge(img,f" {zone} ",162,22,zc,w=80)
-    nc = (30,110,30) if nav_state=="NORMAL" else ((25,90,160) if "JUNCTION" in nav_state else (90,55,20))
-    _badge(img,f" {nav_state} ",252,22,nc,w=130)
-    cd = f"{curve_dist_m:.1f}m" if curve_dist_m<99 else "--"
-    ucc=(30,110,30) if upcoming_curve=="STRAIGHT" else ((25,90,160) if "LEFT" in upcoming_curve else (20,55,140))
-    _badge(img,f" {upcoming_curve}@{cd} ",392,22,ucc,w=120)
-    sc = (30,110,30) if snap_miss<5 else ((25,90,160) if snap_miss<20 else (0,0,160))
-    _badge(img,f" SNAP:{snap_miss} ",522,22,sc,w=80)
-    _lbl(img, "→YAW  →MOV  ◔DRIFT", w-200, 22, scale=0.30, color=(150,150,150))
-    return img
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Junction detector
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AutonomousJunctionPlanner:
-    def decide(self, warped_binary, left_fit, right_fit, lane_width_px):
-        lroi=warped_binary[0:240,0:320]; rroi=warped_binary[0:240,320:640]; sroi=warped_binary[0:240,200:440]
-        wts=np.linspace(2.0,0.5,240).reshape(-1,1)
-        ls=np.sum(lroi*wts)/(320*240); rs=np.sum(rroi*wts)/(320*240); ss=np.sum(sroi*wts)/(240*240)
-        scores={"LEFT":ls,"RIGHT":rs,"STRAIGHT":ss}
-        best=max(scores,key=scores.get); total=sum(scores.values())
-        conf=scores[best]/max(total,1e-6)
-        return ("RIGHT",0.3) if conf<0.4 else (best,conf)
-
-class JunctionDetector:
-    ENTRY_FRAMES=5; EXIT_FRAMES=8; RATIO_EARLY_WARN=1.7; MIN_BOT_ENERGY=500
-    def __init__(self):
-        self.state="NORMAL"; self.entry_count=0; self.exit_count=0
-        self.frames_in_jct=0; self.planner=AutonomousJunctionPlanner()
-    def update(self, warped_binary, left_fit, right_fit, lane_width_px, active_labels):
-        h,w=warped_binary.shape
-        approaching_wide=False
-        if left_fit is not None and right_fit is not None:
-            if (np.polyval(right_fit,150)-np.polyval(left_fit,150))>lane_width_px*self.RATIO_EARLY_WARN:
-                approaching_wide=True
-        elif left_fit is not None:
-            if np.polyval(left_fit,150)<max(0,320-lane_width_px*self.RATIO_EARLY_WARN): approaching_wide=True
-        elif right_fit is not None:
-            if np.polyval(right_fit,150)>min(640,320+lane_width_px*self.RATIO_EARLY_WARN): approaching_wide=True
-        hist_bot=float(np.sum(warped_binary[h//2:,:])); hist_top=float(np.sum(warped_binary[:h//2,:]))
-        cross_e=False
-        if hist_bot>self.MIN_BOT_ENERGY and (hist_top/hist_bot)>1.4: cross_e=True
-        if "crosswalk-sign" in active_labels: cross_e=False
-        evidence=approaching_wide or cross_e
-        if self.state=="NORMAL":
-            self.entry_count=self.entry_count+1 if evidence else 0
-            if self.entry_count>=self.ENTRY_FRAMES:
-                self.state="JUNCTION_PROMPT"; self.exit_count=0; self.frames_in_jct=0
-        elif self.state.startswith("JUNCTION_"):
-            self.frames_in_jct+=1
-            self.exit_count=self.exit_count+1 if not evidence else 0
-            if self.exit_count>=self.EXIT_FRAMES and self.frames_in_jct>25:
-                self.state="NORMAL"; self.entry_count=0
-        return self.state
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Orchestrator
-# ══════════════════════════════════════════════════════════════════════════════
-
-class Orchestrator:
-    BASE_SPEED = 50
-    MAP_W=600; MAP_H=440
-    CAM_W=640; CAM_H=480
-    LOC_W=640; LOC_H=480
-    TEL_W=560; TEL_H=480
-
-    def __init__(self, sim_mode=False, base_speed=None, svg_path=None):
-        self.sim_mode   = sim_mode
-        self.base_speed = base_speed or self.BASE_SPEED
-        self.svg_path   = svg_path or SVG_PATH_DEFAULT
-        self.running    = False
-        self._estop     = False
-        self._pilot_thread = None
-
-        self.hw           = HardwareIO(sim_mode=sim_mode)
-        self._start_node  = None
-        self._target_node = None
-        self._planned_path= []
-        self._path_cursor = 0
-        self._blocked_nodes = {}
-
-        self.vision         = VisionPipeline()
-        from perception import PerceptionResult
-        import numpy as _np
-        self._last_perc = PerceptionResult(
-            warped_binary=_np.zeros((480,640), dtype=_np.uint8),
-            lane_dbg=_np.zeros((480,640,3), dtype=_np.uint8),
-            sl=None, sr=None,
-            target_x=320.0, lateral_error_px=0.0,
-            anchor="INIT", confidence=0.0,
-            lane_width_px=280.0, curvature=0.0,
-        )
-        try:
-            if _TRAFFIC_AVAILABLE:
-                self._threaded_yolo = ThreadedYOLODetector("best.pt")
-                self.traffic_engine = TrafficDecisionEngine(self._threaded_yolo)
-            else: raise RuntimeError
-        except Exception:
-            self._threaded_yolo = None
-            self.traffic_engine = TrafficDecisionEngine(None)
-
-        self.jct_detector   = JunctionDetector()
-        self.controller     = Controller()
-        self.localizer      = LocalizationEngine()
-
-        self._fps        = 0.0
-        self._nav_state  = "NORMAL"
-        self._last_ctrl  = ControlOutput(0.0, 0.0, 320.0, "INIT", 200)
-        self._last_conf  = 0.0
-        self._last_t_res = None
-        self._sign_history = deque(maxlen=20)
-
-        self._svg_base     = _load_svg_as_cv2(self.svg_path, self.MAP_W, self.MAP_H)
-        self._map_renderer = MapOverlayRenderer(self._svg_base, MAP_W_M, MAP_H_M)
-        self._graph_renderer = (
-            GraphMLRenderer(self.localizer.planner, self.MAP_W, self.MAP_H)
-            if self.localizer.planner else None
-        )
-        # Step D: inject graph renderer so map render() can call render_on()
-        self._map_renderer._graph_renderer = self._graph_renderer
-        self._loc_panel    = LocalizationPanel(self.LOC_W, self.LOC_H)
-
-        self._q_yolo  = queue.Queue(maxsize=1)
-        self._q_bev   = queue.Queue(maxsize=1)
-        self._q_loc   = queue.Queue(maxsize=1)
-        self._speed_ema        = 0.0    # exponential moving average of speed command
-        self._SPEED_EMA_ALPHA  = 0.25   # 0.25 = slow smooth; raise to 0.5 for faster response
-        self._traffic_mult_ema = 1.0    # EMA of YOLO traffic multiplier — sticky decisions
-        self._TRAFFIC_EMA_ALPHA = 0.15  # very slow — traffic decisions should be sticky
-        self._curve_dist_ema   = 99.0   # EMA of curve distance — smooths waypoint jumps
-        self._CURVE_EMA_ALPHA  = 0.20   # 20% new, 80% history per frame
-        self._q_map  = queue.Queue(maxsize=1)
-
-    def build_ui(self, root):
-        self._root = root
-        root.title("BFMC Pilot v4 — Live Localization Dashboard")
-        root.configure(bg="#0d0d0d")
-        root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Status bar (VIZ-07)
-        self._sf = tk.Frame(root, bg="#1a1a1a"); self._sf.pack(fill=tk.X)
-        self._sl = tk.Label(self._sf, bg="#1a1a1a"); self._sl.pack(fill=tk.X)
-        self._refresh_status_label(np.full((32,1290,3),28,np.uint8))
-
-        # Control bar — at TOP so buttons are always visible without scrolling
-        cb = tk.Frame(root, bg="#111", pady=4); cb.pack(fill=tk.X, padx=6, pady=(2,2))
-        self._sv_pose = tk.StringVar(value="Pose: not set")
-        self._sv_hint = tk.StringVar(value="Click map: set START")
-        tk.Label(cb, textvariable=self._sv_pose, bg="#111", fg="#eee",
-                 font=("Courier",9)).pack(side=tk.LEFT, padx=10)
-        tk.Label(cb, textvariable=self._sv_hint, bg="#111", fg="#ffcc00",
-                 font=("Courier",9,"bold")).pack(side=tk.LEFT, padx=10)
-        bf = tk.Frame(cb, bg="#111"); bf.pack(side=tk.RIGHT, padx=8)
-        for txt, bg, cmd in [("E-STOP",     "#c0392b", self._estop_cb),
-                              ("RESUME",     "#27ae60", self._resume_cb),
-                              ("RESET ROUTE","#2471a3", self._reset_route),
-                              ("START",      "#8e44ad", self._start_pilot)]:
-            tk.Button(bf, text=txt, bg=bg, fg="white",
-                      font=("Courier",9,"bold"),
-                      command=cmd).pack(side=tk.LEFT, padx=4)
-
-        # Row 1: MAP+GRAPH | YOLO+CALIB | BEV
-        r1 = tk.Frame(root, bg="#0d0d0d"); r1.pack(padx=4, pady=2)
-        for col, title, fg, attr, blank in [
-            (0, " MAP + GRAPH OVERLAY ", "#00e5ff", "_map_label",
-             cv2.cvtColor(self._svg_base, cv2.COLOR_BGR2RGB)),
-            (1, " CAMERA + YOLO ", "#ff9100", "_yolo_label",
-             np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)),
-            (2, " BEV LANE VIEW ", "#69ff47", "_bev_label",
-             np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)),
-        ]:
-            fr = tk.LabelFrame(r1,text=title,bg="#0d0d0d",fg=fg,font=("Courier",9,"bold"))
-            fr.grid(row=0,column=col,padx=4)
-            lbl = tk.Label(fr,bg="#0d0d0d"); lbl.pack()
-            ph  = ImageTk.PhotoImage(Image.fromarray(blank))
-            lbl.config(image=ph)
-            setattr(self,attr,lbl)
-            setattr(self,attr.replace("label","ph"),ph)
-        self._map_label.bind("<Button-1>", self._on_map_click)
-
-        # Row 2: Localization | Telemetry (BEV moved to Row 1)
-        r2 = tk.Frame(root, bg="#0d0d0d"); r2.pack(padx=4, pady=(0,2))
-        for col, title, fg, attr, blank in [
-            (0, " LOCALIZATION ENGINE ", "#ff4fd8", "_loc_label",
-             np.full((self.LOC_H, self.LOC_W, 3), 18, np.uint8)),
-            (1, " TELEMETRY ", "#ff9100", "_telem_label",
-             np.full((self.TEL_H, self.TEL_W, 3), 18, np.uint8)),
-        ]:
-            fr = tk.LabelFrame(r2,text=title,bg="#0d0d0d",fg=fg,font=("Courier",9,"bold"))
-            fr.grid(row=0,column=col,padx=4)
-            lbl = tk.Label(fr,bg="#0d0d0d"); lbl.pack()
-            ph  = ImageTk.PhotoImage(Image.fromarray(blank))
-            lbl.config(image=ph)
-            setattr(self,attr,lbl)
-            setattr(self,attr.replace("label","ph"),ph)
-
-
-
-        self._gui_update()
-
-    def _refresh_status_label(self, img):
-        ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(img,cv2.COLOR_BGR2RGB)))
-        self._sl.config(image=ph); self._sl.photo = ph  # keep reference
-
-    def _on_map_click(self, event):
-        if not self.localizer.planner: return
-        if len(self.localizer.planner.graph.nodes)==0:
-            self._sv_hint.set("Graph empty"); return
-        x_m, y_m = pixel_to_map(event.x, event.y, self.MAP_W, self.MAP_H)
-        nearest   = self.localizer.planner.get_nearest_node(x_m, y_m)
-        if not nearest: return
-
-        if self._start_node is None:
-            self._start_node = nearest
-            self.localizer.set_pose(x_m, y_m, 0.0)
-            self._sv_hint.set(f"Start: {nearest}  → click DESTINATION")
-        elif self._target_node is None:
-            self._target_node = nearest
-            planned = self.localizer.planner.plan_route(self._start_node, nearest)
-            if not planned:
-                self._sv_hint.set(f"No path to {nearest}. Try another dest.")
-                self._target_node = None; return
-            self._planned_path = planned; self._path_cursor = 0
-            self.localizer.reset_cursor()
-            self._sv_hint.set(f"Route: {len(planned)} nodes. Press START.")
-        else:
-            self._target_node = nearest
-            cx,cy,_ = self.localizer.get_pose()
-            ns = self.localizer.planner.get_nearest_node(cx,cy)
-            planned = self.localizer.planner.plan_route(ns, nearest)
-            if planned:
-                self._planned_path = planned; self._path_cursor = 0
-                self.localizer.reset_cursor()
-                self._sv_hint.set(f"Re-routed: {len(planned)} nodes.")
-
-    def _gui_update(self):
-        try:
-            x, y, yaw = self.localizer.get_pose()
-            conf      = self._last_conf
-            nearest   = (self.localizer.planner.get_nearest_node(x,y)
-                         if self.localizer.planner else None)
-            loc_data  = self.localizer.get_pose_for_dashboard()
-            zone      = loc_data.get("zone","CITY")
-            snap_miss = getattr(self.localizer,'_snap_miss_frames',0)
-            hconf_raw = getattr(self.localizer,'_cam_yaw_smoothed',0.0)
-
-            # Root Cause B: always add trail if we have a plausible position (not at 0,0 default)
-            if x != 0.0 or y != 0.0:
-                self._map_renderer.add_trail_point(x, y)
-
-            # Root Cause C: read map frame from pilot-thread queue (non-blocking)
+    _IMU_AVAILABLE = False
+    class BNO055_IMU:
+        def get_yaw(self): return 0.0
+
+try:
+    from picamera2 import Picamera2
+    _CAM_AVAILABLE = True
+except ImportError:
+    _CAM_AVAILABLE = False
+
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+class BFMC_Pilot:
+    def __init__(self, sim_mode=False):
+        self.sim_mode = sim_mode
+        self.base_speed = 40.0
+        
+        # --- Hardware Initialization ---
+        self.serial = STM32_SerialHandler()
+        self.connected = False if sim_mode else self.serial.connect()
+        
+        self.imu = BNO055_IMU()
+        self.prev_yaw = self.imu.get_yaw()
+        
+        self.safety = SafetySupervisor()
+        
+        self.cam_ok = False
+        if not sim_mode and _CAM_AVAILABLE:
             try:
-                map_img = self._q_map.get_nowait()
-                self._map_ph = ImageTk.PhotoImage(
-                    Image.fromarray(cv2.cvtColor(map_img, cv2.COLOR_BGR2RGB)))
-                self._map_label.config(image=self._map_ph)
-            except queue.Empty:
-                pass   # keep the last displayed map image
+                self.picam2 = Picamera2()
+                cfg = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
+                self.picam2.configure(cfg)
+                self.picam2.start()
+                self.cam_ok = True
+            except Exception as e:
+                log.error(f"Camera init failed: {e}")
 
-            if self.localizer.is_initialized():
-                self._sv_pose.set(
-                    f"x={x:.3f}m  y={y:.3f}m  yaw={math.degrees(yaw):.1f}°  snap={snap_miss}")
+        # --- Stack Initialization ---
+        self.vision = VisionPipeline()
+        self.controller = Controller()
 
-            try:
-                yi = self._q_yolo.get_nowait()
-            except queue.Empty:
-                # Pilot not running yet — show live camera preview so panel is never blank
-                if hasattr(self, 'hw'):
-                    yi = self.hw.read_camera()
-                    if yi is None or not yi.any():
-                        yi = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
-                        cv2.putText(yi, "WAITING FOR CAMERA...", (60, 240),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 2)
-                else:
-                    yi = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+        # OpenCV Dashboard UI
+        cv2.namedWindow("BFMC_Pilot_Dashboard", cv2.WINDOW_NORMAL)
+        cv2.createTrackbar("Base Speed", "BFMC_Pilot_Dashboard", int(self.base_speed), 100, self._update_speed)
+        
+        self.last_time = time.time()
+        self.fps = 0.0
 
-            yi = cv2.resize(yi,(self.CAM_W,self.CAM_H))
-            self._yolo_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(yi,cv2.COLOR_BGR2RGB)))
-            self._yolo_label.config(image=self._yolo_ph)
+    def _update_speed(self, val):
+        self.base_speed = float(val)
 
-            try:
-                bi = self._q_bev.get_nowait()
-            except queue.Empty:
-                if getattr(self, '_last_perc', None) is not None:
-                    bi = _annotate_bev(self._last_perc, getattr(self, '_last_ctrl', None))
-                else:
-                    bi = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
-                    cv2.putText(bi, "BEV NOT READY", (160, 240),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 60), 2)
+    def compute_yaw_rate(self, dt):
+        """Calculates rotational velocity (rad/s) from the IMU to feed the ESC."""
+        current_yaw = self.imu.get_yaw()
+        # Wrap angle difference to [-pi, pi] to prevent jumps when crossing 0/360
+        delta_yaw = (current_yaw - self.prev_yaw + math.pi) % (2 * math.pi) - math.pi
+        self.prev_yaw = current_yaw
+        return delta_yaw / max(dt, 0.001)
 
-            bi = cv2.resize(bi,(self.CAM_W,self.CAM_H))
-            self._bev_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(bi,cv2.COLOR_BGR2RGB)))
-            self._bev_label.config(image=self._bev_ph)
+    def draw_dashboard(self, frame, perc_res, ctrl_res, imu_yaw_rate):
+        """Creates a unified heads-up display combining camera and BEV tracker."""
+        # 1. Prepare BEV debug image
+        bev_dbg = perc_res.lane_dbg.copy()
+        
+        # Draw target crosshair
+        cv2.circle(bev_dbg, (int(ctrl_res.target_x), int(perc_res.y_eval)), 8, (0, 255, 0), -1)
+        cv2.line(bev_dbg, (int(ctrl_res.target_x), int(perc_res.y_eval)), (320, 480), (0, 255, 0), 2)
+        cv2.line(bev_dbg, (320, 450), (320, 480), (0, 0, 255), 3) # Car center
 
-            try:
-                li = self._q_loc.get_nowait()
-                li = cv2.resize(li,(self.LOC_W,self.LOC_H))
-                self._loc_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(li,cv2.COLOR_BGR2RGB)))
-                self._loc_label.config(image=self._loc_ph)
-            except queue.Empty: pass
+        # 2. Resize original frame to fit next to BEV
+        frame_resized = cv2.resize(frame, (640, 480))
+        
+        # 3. Stack images horizontally
+        dashboard = np.hstack((frame_resized, bev_dbg))
+        
+        # 4. Draw Telemetry Overlay
+        h, w = dashboard.shape[:2]
+        overlay = dashboard.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, dashboard, 0.3, 0, dashboard)
 
-            ctrl  = self._last_ctrl
-            perc  = self._last_perc
-            vm    = self.hw.get_velocity() if self.running else loc_data.get("speed_ms",0.0)
-            vm_src= self.hw.get_velocity_source() if self.running else "PWM_EST"
-            ti = _draw_telemetry_panel(
-                steer         = ctrl.steer_angle_deg,
-                speed_pwm     = ctrl.speed_pwm,
-                lat_err       = ctrl.target_x-320.0,
-                conf          = conf,
-                anchor        = ctrl.anchor,
-                zone          = zone,
-                upcoming_curve= getattr(self.localizer,'upcoming_curve','STRAIGHT'),
-                fps           = self._fps,
-                sign_history  = list(self._sign_history),
-                nav_state     = self._nav_state,
-                l_conf        = (1.0 if (perc and perc.sl is not None) else 0.0),
-                r_conf        = (1.0 if (perc and perc.sr is not None) else 0.0),
-                curvature     = perc.curvature if perc else 0.0,
-                velocity_ms   = vm,
-                velocity_src  = vm_src,
-                w=self.TEL_W, h=self.TEL_H)
-            self._telem_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(ti,cv2.COLOR_BGR2RGB)))
-            self._telem_label.config(image=self._telem_ph)
+        color_ok = (0, 255, 0)
+        color_warn = (0, 165, 255)
+        color_err = (0, 0, 255)
 
-            cd  = getattr(self.localizer,'curve_dist_m',99.0)
-            uc  = getattr(self.localizer,'upcoming_curve','STRAIGHT')
-            si  = _status_bar(1290,self._estop,self._fps,zone,self._nav_state,uc,cd,conf,snap_miss)
-            self._refresh_status_label(si)
+        anchor_color = color_ok if "DUAL" in ctrl_res.anchor else (color_warn if "ONLY" in ctrl_res.anchor else color_err)
 
-        except Exception as e:
-            log.debug(f"GUI update error: {e}")
+        cv2.putText(dashboard, f"FPS: {self.fps:.1f} | Speed PWM: {ctrl_res.speed_pwm:.1f}", (10, 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        cv2.putText(dashboard, f"Steer: {ctrl_res.steer_angle_deg:.1f} deg | Yaw Rate: {math.degrees(imu_yaw_rate):.1f} deg/s", (10, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        if hasattr(self,'_root') and self._root.winfo_exists():
-            self._root.after(33, self._gui_update)
+        cv2.putText(dashboard, f"Anchor: {ctrl_res.anchor}", (w // 2 + 10, 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, anchor_color, 2)
+                    
+        cv2.putText(dashboard, f"Lane Width: {perc_res.lane_width_px:.0f}px", (w // 2 + 10, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    def _pilot_loop(self):
-        log.info("Pilot loop started")
-        startup_time = time.time()   # reference for calibration phases
-        t_prev = time.time()
-        _ll = 0; _LLC = 15; _LLS = 90; _zmf = 0
+        cv2.imshow("BFMC_Pilot_Dashboard", dashboard)
+
+    def run(self):
+        log.info("Starting Vision+IMU Pilot. (Localization disabled)")
         
         try:
-            imu = BNO055_IMU()   # safe — degrades to sim if hardware absent
-            imu.start()
-        except Exception as e:
-            log.error(f"IMU init failed: {e} — using null IMU")
-            imu = BNO055_IMU.__new__(BNO055_IMU)
-            imu._yaw_offset = 0.0; imu._sim_mode = True; imu._sim_yaw = 0.0
-            imu.bus = None
-
-        from visual_calibrator import VisualCalibrator
-        from safety import SafetySupervisor
-        calib = VisualCalibrator(self.localizer.planner, self.localizer, self.vision)
-        calibration_done = False
-        safety = SafetySupervisor()   # created AFTER IMU init so timers start fresh
-
-        loc_data = {
-            "x": 0.0, "y": 0.0, "yaw_deg": 0.0,
-            "zone": "CITY", "upcoming_curve": "STRAIGHT",
-            "curve_dist_m": 99.0, "cursor": 0, "speed_ms": 0.0,
-            "initialized": False, "snap_miss": 0,
-            "heading_conf_smoothed": 0.0,
-            "health": {"imu": 0.0, "cam": 0.0, "snap": 0.0, "overall": 0.0},
-        }
-
-        try:
-            while self.running:
-                try:
-                    loc_data = self.localizer.get_pose_for_dashboard()
-                    ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
-                    elapsed_run = ts - startup_time
-
-                    # Always read camera & velocity so dashboard stays live
-                    raw_frame   = self.hw.read_camera()
-                    if raw_frame is None:
-                        raw_frame = np.zeros((480, 640, 3), np.uint8)
-                    elif raw_frame.any():
-                        safety.update_camera()
-                    velocity_ms = self.hw.get_velocity()
-                    safety.update_encoder()  # stamp encoder locally upon reading velocity
-                    safety.update_yolo()     # always alive — traffic check handled separately
-
-                    if not calibration_done:
-                        calib.add_frame(raw_frame)
-                        self._sv_hint.set(calib._result.status_msg)
-                        self.hw.set_speed(0)
-                        self.hw.set_steering(0)
-                        safety.update_serial()
-                        safety.update_yolo()   # keep safety supervisor alive during calibration
-
-                        if elapsed_run > 3.0:
-                            try:
-                                result = calib.finalize()
-                                if result.success:
-                                    self.vision.update_bev_transform(result.src_pts)
-                                    initial_heading_rad = math.radians(result.initial_heading_deg)
-                                    self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
-                                    imu_heading = imu.get_yaw()
-                                    imu.set_offset(initial_heading_rad - imu_heading)
-                                    self._sv_hint.set("Pilot running…")
-                                else:
-                                    log.warning("Visual calibration failed — using default BEV transform and zero heading")
-                                    initial_heading_rad = 0.0
-                                    self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
-                            except Exception as e:
-                                log.error(f"Calibration finalize() exception: {e} — proceeding with defaults")
-                                initial_heading_rad = 0.0
-                                self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
-                            finally:
-                                calibration_done = True   # ALWAYS exit calibration phase after elapsed_run > 3.0
-
-                        # Keep dashboard updated during calibration
-                        self._last_perc = self.vision.process(raw_frame)
-                        push_latest(self._q_bev, _annotate_bev(
-                            self._last_perc, self._last_ctrl))   # BEV live during calibration
-                        if self.traffic_engine:
-                            self._last_t_res = self.traffic_engine.process(raw_frame, "CONTINUOUS")
-                        else:
-                            self._last_t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
-
-                        elapsed = time.time()-ts
-
-                        # ── CALIBRATION OVERLAY — pushed to camera panel ─────────────────
-                        calib_vis = raw_frame.copy()
-                        h_vis, w_vis = calib_vis.shape[:2]
-
-                        # Draw vanishing-point candidates accumulated so far
-                        try:
-                            from visual_calibrator import _detect_vanishing_point
-                            vp = _detect_vanishing_point(raw_frame)
-                            if vp is not None:
-                                vx, vy = int(vp[0]), int(vp[1])
-                                cv2.drawMarker(calib_vis, (vx, vy), (0, 255, 255),
-                                               cv2.MARKER_CROSS, 30, 2, cv2.LINE_AA)
-                                cv2.circle(calib_vis, (vx, vy), 12, (0, 255, 255), 2)
-                                _lbl(calib_vis, f"VP ({vx},{vy})", vx+14, vy-8,
-                                     scale=0.5, color=(0,255,255))
-                        except Exception:
-                            pass  # visual_calibrator may not export _detect_vanishing_point
-
-                        # Draw the BEV trapezoid SRC_PTS on the camera frame
-                        src = self.vision.SRC_PTS.astype(np.int32)
-                        cv2.polylines(calib_vis, [src[[0,1,3,2]].reshape(-1,1,2)],
-                                      True, (0, 180, 255), 2, cv2.LINE_AA)
-                        for pt in src:
-                            cv2.circle(calib_vis, tuple(pt), 5, (0,180,255), -1)
-                        _lbl(calib_vis, "BEV TRAPEZOID",
-                             int(src[:,0].mean())-50, int(src[:,1].min())-8,
-                             scale=0.4, color=(0,180,255))
-
-                        # Status bar with VP/HDG candidate counts
-                        n_vp  = len(getattr(calib, '_vp_candidates',  []))
-                        n_hdg = len(getattr(calib, '_heading_candidates', []))
-                        n_frm = len(getattr(calib, '_frames', []))
-                        bar_txt = (f"CALIBRATING  frames={n_frm}  "
-                                   f"VP={n_vp}  HDG={n_hdg}  "
-                                   f"t={elapsed_run:.1f}s / 3.0s")
-                        cv2.rectangle(calib_vis, (0, 0), (w_vis, 28), (20,20,20), -1)
-                        _lbl(calib_vis, bar_txt, 8, 20, scale=0.45, color=(50,220,220))
-
-                        # Countdown arc (top-right corner)
-                        frac = min(elapsed_run / 3.0, 1.0)
-                        cv2.ellipse(calib_vis, (w_vis-36, 36), (28, 28), -90,
-                                    0, int(frac * 360), (0,200,100), 3, cv2.LINE_AA)
-                        _lbl(calib_vis, f"{max(0.0, 3.0-elapsed_run):.1f}s",
-                             w_vis-52, 42, scale=0.40, color=(0,200,100))
-
-                        push_latest(self._q_yolo, calib_vis)
-                        # ── END calibration overlay ───────────────────────────────────────
-
-                        time.sleep(max(0.001, FRAME_PERIOD-elapsed))
-                        continue
-
-                    # --- EXTRACT PREDICTIVE MAP DATA (available even during E-STOP) ---
-                    upcoming_curve = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
-                    curve_dist_m   = getattr(self.localizer, 'curve_dist_m',   99.0)
-                    # Smooth curve distance to prevent braking oscillation from discrete waypoint jumps
-                    if curve_dist_m < 99.0:
-                        self._curve_dist_ema = (self._CURVE_EMA_ALPHA * curve_dist_m
-                                                + (1.0 - self._CURVE_EMA_ALPHA) * self._curve_dist_ema)
-                    else:
-                        self._curve_dist_ema = min(self._curve_dist_ema + 0.05, 99.0)  # slowly recover
-                    curve_dist_m = self._curve_dist_ema   # use smoothed value for controller
-                    map_curvature  = 0.0
-                    if self._planned_path and self.localizer.planner:
-                        try:
-                            _curv_zone = getattr(self.localizer, 'current_zone', 'CITY')
-                            _curv_win  = 0.8 if _curv_zone == 'CITY' else 1.2
-                            map_curvature = self.localizer.planner.get_path_curvature(
-                                self.localizer.x, self.localizer.y,
-                                self._planned_path,
-                                cursor=self._path_cursor,
-                                window_m=_curv_win)
-                        except Exception:
-                            pass
-
-                    self._fps = 0.7*self._fps + 0.3*(1.0/dt)
-
-                    # --- TRAFFIC ENGINE (runs even in E-STOP for YOLO feed) ---
-                    if self.traffic_engine:
-                        x0,y0,_ = self.localizer.get_pose()
-                        ei = {}
-                        if self._planned_path and self.localizer.planner:
-                            ei = self.localizer.planner.get_current_edge_info(
-                                x0,y0,self._planned_path,self._path_cursor)
-                        t_res = self.traffic_engine.process(
-                            raw_frame, "DASHED" if ei.get("dotted") else "CONTINUOUS")
-                    else:
-                        t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
-
-                    if self._threaded_yolo and not self._threaded_yolo.is_alive():
-                        t_res.speed_multiplier = 0.3
-
-                    # Smooth the traffic multiplier — YOLO detections are noisy frame-to-frame
-                    self._traffic_mult_ema = (self._TRAFFIC_EMA_ALPHA * t_res.speed_multiplier
-                                              + (1.0 - self._TRAFFIC_EMA_ALPHA) * self._traffic_mult_ema)
-
-                    self._last_t_res = t_res
-
-                    if self._estop:
-                        # Halted — keep motors off, reuse last perception for dashboard
-                        self.hw.set_speed(0); self.hw.set_steering(0)
-                        safety.update_serial() # Update serial after setting speed/steering
-                        perc = self._last_perc if self._last_perc else self.vision.process(raw_frame)
-                        ctrl = self._last_ctrl
-
-                        # F-15: Auto-recovery — attempt re-detection every loop tick.
-                        # If lanes are visible again, clear E-STOP and resume driving.
-                        try:
-                            recovery_perc = self.vision.process(raw_frame, dt=dt)
-                            if recovery_perc.confidence > 0.4:
-                                self._estop = False
-                                _ll = 0
-                                log.info("F-15: E-STOP cleared — lanes re-detected (conf=%.2f)", recovery_perc.confidence)
-                        except Exception:
-                            pass
-
-                    else:
-                        # --- NORMAL DRIVING ---
-                        now = time.time()
-                        for n,t in list(self._blocked_nodes.items()):
-                            if now>=t: del self._blocked_nodes[n]
-
-                        for lbl in t_res.active_labels:
-                            for kw in ("stop","traffic","highway","roundabout","parking",
-                                       "crosswalk","priority","no-entry","speed"):
-                                if kw in lbl.lower():
-                                    self._sign_history.append((lbl,0.9,time.time())); break
-
-                        if ("NO-ENTRY" in t_res.reason and self._planned_path and self.localizer.planner):
-                            xne,yne,_ = self.localizer.get_pose()
-                            nn = self.localizer.planner.get_nearest_node(xne,yne)
-                            if nn and nn not in self._blocked_nodes:
-                                self._blocked_nodes[nn] = time.time()+30.0
-                                if nn in self.localizer.planner.graph:
-                                    self.localizer.planner.graph.remove_node(nn)
-                                    rem = [n for n in self.localizer.planner._node_ids
-                                           if n in self.localizer.planner.graph]
-                                    import scipy.spatial
-                                    self.localizer.planner._node_ids = rem
-                                    self.localizer.planner._kdtree = scipy.spatial.KDTree(
-                                        [self.localizer.planner.node_positions[n] for n in rem])
-                                    ns2 = self.localizer.planner.get_nearest_node(xne,yne)
-                                    np2 = self.localizer.planner.plan_route(ns2,self._target_node)
-                                    self.localizer.planner.load_graph("Competition_track_graph.graphml")
-                                    if np2:
-                                        self._planned_path=np2; self._path_cursor=0
-                                        self.localizer.reset_cursor()
-
-                        if self.localizer.planner and self.localizer.is_initialized():
-                            xz,yz,_ = self.localizer.get_pose()
-                            mz = self.localizer.planner.get_zone(xz,yz)
-                            _zmf = _zmf+1 if mz!=t_res.zone_mode else 0
-                            if _zmf>=90 and self.traffic_engine:
-                                self.traffic_engine._zone_mode=mz; _zmf=0
-
-                        extra_offset = -80.0 if t_res.state=="SYS_LANE_CHANGE_LEFT" else 0.0
-
-                        if (self._planned_path and self.localizer.planner
-                                and 0<=self._path_cursor<len(self._planned_path)):
-                            node_now = self._planned_path[self._path_cursor]
-                            if self.localizer.planner.is_roundabout_node(node_now):
-                                if self._nav_state=="NORMAL": self._nav_state="ROUNDABOUT"
-                            elif self._nav_state=="ROUNDABOUT": self._nav_state="NORMAL"
-
-                        perc = self.vision.process(
-                            raw_frame,
-                            dt=dt,
-                            extra_offset_px=extra_offset,
-                            nav_state=self._nav_state,
-                            velocity_ms=velocity_ms,
-                            last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0),
-                            upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'))
-                        self._last_conf = perc.confidence; self._last_perc = perc
-
-                        self._nav_state = self.jct_detector.update(
-                            perc.warped_binary,perc.sl,perc.sr,perc.lane_width_px,t_res.active_labels)
-
-                        if self._nav_state=="JUNCTION_PROMPT":
-                            if self._planned_path and self.localizer.planner:
-                                xj,yj,yj2 = self.localizer.get_pose()
-                                action = self.localizer.planner.get_next_action(
-                                    xj,yj,yj2,path=self._planned_path,
-                                    cursor=self._path_cursor,velocity_ms=velocity_ms)
-                                self._nav_state = f"JUNCTION_{action}"
-                            else: self._nav_state="JUNCTION_STRAIGHT"
-
-                        imu_yaw = imu.read_yaw()
-                        self.localizer.update(
-                            velocity_ms=velocity_ms, dt=dt,
-                            camera_heading_rad=perc.heading_rad,
-                            camera_confidence=perc.confidence,
-                            heading_conf=perc.heading_conf,
-                            path=self._planned_path,
-                            optical_yaw_rate=perc.optical_yaw_rate,
-                            optical_vel=perc.optical_vel,
-                            current_steer_rad=math.radians(getattr(self._last_ctrl,'steer_angle_deg',0.0)),
-                            imu_yaw=imu_yaw)
-                        self._path_cursor = self.localizer.path_cursor
-
-                        self.localizer.get_upcoming_curve_from_path(
-                            self._planned_path,self._path_cursor,velocity_ms)
-
-                        ctrl = self.controller.compute(
-                            perc_res=perc, nav_state=self._nav_state,
-                            base_speed=float(self.base_speed),
-                            traffic_mult=self._traffic_mult_ema,   # smoothed, not raw
-                            velocity_ms=velocity_ms, dt=dt,
-                            map_curvature=map_curvature,
-                            upcoming_curve=upcoming_curve,
-                            curve_dist_m=curve_dist_m)
-
-                        # --- STARTUP CALIBRATION OVERRIDE ---
-                        # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
-                        # Stage 2 (3-6 s): crawl at ≤15 PWM — warm up EMA lane tracker.
-                        if not calibration_done:
-                            if elapsed_run < 3.0:
-                                ctrl.speed_pwm       = 0.0
-                                ctrl.steer_angle_deg = 0.0
-                                cv2.putText(perc.lane_dbg,
-                                    f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
-                                    (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-                            elif elapsed_run < 6.0:
-                                ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
-                                cv2.putText(perc.lane_dbg,
-                                    f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
-                                    (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
-
-                        ctrl.speed_pwm *= safety.safe_speed_override()
-                        safety.update_encoder() # Update encoder after speed calculation
-                        self._last_ctrl = ctrl
-
-                        # Both lanes lost: count toward E-STOP
-                        _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
-                        if _ll >= _LLS:
-                            self.hw.set_speed(0); self.hw.set_steering(0)
-                            safety.update_serial()
-                            self._estop = True
-                        else:
-                            speed = ctrl.speed_pwm
-                            if _ll >= _LLC:
-                                speed = min(speed, 20.0)   # both lost: crawl
-
-                            # Single-lane-lost: sr gone (DIVIDER_FOLLOW or RL_FROM_EDGE stale)
-                            # Reduce to 70% of base to buy time for lane recovery.
-                            # sl visible alone is enough to trigger this.
-                            elif perc.sr is None and perc.sl is not None:
-                                speed = min(speed, ctrl.speed_pwm * 0.70)
-
-                            # Dead reckoning with decayed confidence: additional penalty
-                            if "DEAD_RECKONING" in perc.anchor:
-                                try:
-                                    dr_conf = float(perc.anchor.split("_")[2])
-                                except Exception:
-                                    dr_conf = 0.5
-                                if dr_conf < 0.5:   # only cut when confidence is low
-                                    speed = min(speed, ctrl.speed_pwm * 0.55)
-
-                            # Traffic Manager speed limit
-                            limit = None
-                            if hasattr(self, "tm") and self.tm:
-                                limit = self.tm.get_speed_limit(
-                                    self._path_cursor,
-                                    getattr(self.localizer, 'zone', 'CITY')
-                                )
-                            if limit is not None:
-                                speed = min(speed, limit)
-
-                            if 0.0 < speed < PWM_DEADBAND: speed = PWM_DEADBAND
-
-                            # Low-pass filter: smooth speed commands so jitter doesn't reach the motor
-                            if speed == 0.0:
-                                self._speed_ema = 0.0      # hard zero on E-STOP / stop commands
-                            else:
-                                self._speed_ema = (self._SPEED_EMA_ALPHA * speed
-                                                   + (1.0 - self._SPEED_EMA_ALPHA) * self._speed_ema)
-                                if self._speed_ema < PWM_DEADBAND:
-                                    self._speed_ema = PWM_DEADBAND
-
-                            self.hw.set_speed(self._speed_ema); self.hw.set_steering(ctrl.steer_angle_deg)
-                            safety.update_serial()
-
-                    # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
-                    yolo_frame = t_res.yolo_debug_frame if (t_res is not None and getattr(t_res, 'yolo_debug_frame', None) is not None) else raw_frame
-                    push_latest(self._q_yolo, yolo_frame)
-                    push_latest(self._q_bev, _annotate_bev(perc, ctrl))
-
-                    # VIZ-03: localization panel
-                    sm     = getattr(self.localizer,'_snap_miss_frames',0)
-                    lx,ly,lyaw = self.localizer.get_pose()
-                    yr     = self.localizer.visual_yaw_rate
-                    self._loc_panel.push(yr, perc.lateral_error_px, lx, ly, sm==0)
-                    vm_src_loc = self.hw.get_velocity_source()
-                    loc_img = self._loc_panel.render(
-                        x=lx, y=ly, yaw_deg=math.degrees(lyaw),
-                        yaw_rate=yr, heading_conf=perc.heading_conf,
-                        snap_miss=sm, confidence=perc.confidence,
-                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
-                        curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0),
-                        lat_err_px=perc.lateral_error_px, velocity_ms=velocity_ms,
-                        velocity_src=vm_src_loc,
-                        zone=self.localizer.current_zone, nav_state=self._nav_state,
-                        l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
-                        l2=bool(self._planned_path and perc.confidence>0.5),
-                        l4=sm<5,
-                        health=loc_data.get("health", {}),
-                        loc_data=loc_data)
-                    push_latest(self._q_loc, loc_img)
-
-                    # Root Cause C: render map in pilot thread to keep GUI at full 30Hz
-                    if self.localizer.is_initialized():
-                        snap_miss_m = getattr(self.localizer, '_snap_miss_frames', 0)
-                        hconf_raw_m = getattr(self.localizer, '_cam_yaw_smoothed', 0.0)
-                        conf_m = self._last_conf
-                        zone_m = self.localizer.current_zone
-                        map_img = self._map_renderer.render(
-                            lx, ly, lyaw,
-                            self._planned_path, self._path_cursor,
-                            self.localizer.planner, conf_m, zone_m,
-                            snap_miss=snap_miss_m,
-                            heading_conf=abs(hconf_raw_m) * 2.0)
-                        push_latest(self._q_map, map_img)
-
-                    elapsed = time.time()-ts
-                    time.sleep(max(0.001, FRAME_PERIOD-elapsed))
-                except Exception as e:
-                    log.error("Pilot error", exc_info=True)
-                    continue
-
-        except Exception as e:
-            log.error(f"FATAL Pilot crash: {e}", exc_info=True); self._estop=True
-
-        log.info("Pilot loop exited")
-        self.hw.set_speed(0); self.hw.set_steering(0)
-        safety.update_serial()
-
-
-    def _start_pilot(self):
-        if self.running: return
-        if not getattr(self, 'race_mode', False) and not self.localizer.is_initialized():
-            if hasattr(self, '_sv_hint'):
-                self._sv_hint.set("Set start position on map first!")
-            return
-        self.running=True; self._estop=False
-        self._pilot_thread = threading.Thread(target=self._pilot_loop,daemon=True,name="pilot")
-        self._pilot_thread.start()
-        if hasattr(self, '_sv_hint'):
-            self._sv_hint.set("Pilot running…")
-
-    def _estop_cb(self):
-        self._estop=True; self.hw.set_speed(0); self.hw.set_steering(0)
-        self._sv_hint.set("E-STOP engaged")
-
-    def _resume_cb(self):
-        if not self.running: self._start_pilot()
-        else: self._estop=False; self._sv_hint.set("Resumed")
-
-    def _reset_route(self):
-        self._start_node=None; self._target_node=None
-        self._planned_path=[]; self._path_cursor=0
-        self.localizer.reset_cursor(); self._map_renderer._trail.clear()
-        self._sv_hint.set("Route cleared. Click map: set START")
-
-    def _on_close(self):
-        self.running=False; self._estop=True
-        self.hw.set_speed(0); self.hw.set_steering(0)
-        time.sleep(0.15); self.hw.shutdown()
-        if self._threaded_yolo: self._threaded_yolo.stop()
-        if hasattr(self,'_root'): self._root.destroy()
-
-
-def main():
-    ap = argparse.ArgumentParser(description="BFMC v4 — Visual Localization Pilot")
-    ap.add_argument("--sim",        action="store_true")
-    ap.add_argument("--speed",      type=float, default=50)
-    ap.add_argument("--svg",        type=str,   default=None)
-    ap.add_argument("--sim-video",  type=str,   default=None)
-    ap.add_argument("--race-mode",  action="store_true")
-    ap.add_argument("--start-node", type=str,   default=None,
-                    help="GraphML node ID for the car's start position. "
-                         "E.g. --start-node n42. Run with --list-nodes to see all.")
-    ap.add_argument("--start-yaw",  type=float, default=0.0,
-                    help="Initial heading in degrees (0=East, 90=North).")
-    ap.add_argument("--list-nodes", action="store_true",
-                    help="Print all map node IDs and exit.")
-    args = ap.parse_args()
-
-    orch = Orchestrator(sim_mode=args.sim, base_speed=args.speed,
-                        svg_path=args.svg or SVG_PATH_DEFAULT)
-    orch.race_mode = args.race_mode
-
-    if args.sim_video:
-        orch.hw.sim_video = args.sim_video
-        orch.hw.video_cap = cv2.VideoCapture(args.sim_video)
-
-    # ── Start-node / list-nodes handling ───────────────────────────────────
-    if args.list_nodes:
-        if orch.localizer.planner:
-            for nid, (nx_, ny_) in sorted(orch.localizer.planner.node_positions.items()):
-                print(f"  {nid:>10s}  x={nx_:.2f}  y={ny_:.2f}")
-        sys.exit(0)
-
-    if args.start_node:
-        pp = orch.localizer.planner
-        if pp and args.start_node in pp.node_positions:
-            sx, sy = pp.node_positions[args.start_node]
-            orch.localizer.set_pose(sx, sy, math.radians(args.start_yaw))
-            log.info(f"Start pose set: node={args.start_node} "
-                     f"({sx:.2f},{sy:.2f}) yaw={args.start_yaw:.1f}°")
-        else:
-            log.error(f"--start-node '{args.start_node}' not found in map. "
-                      f"Run with --list-nodes to see valid IDs.")
-            sys.exit(1)
-    else:
-        log.warning("No --start-node provided. Localizer will not initialize "
-                    "until operator clicks start position on the map.")
-
-    if not args.race_mode:
-        root = tk.Tk()
-        orch.build_ui(root)
-        try:
-            root.mainloop()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            orch._on_close()
-    else:
-        print("[INFO] RACE MODE ACTIVE — Heavy rendering disabled.")
-        orch._start_pilot()
-        try:
             while True:
-                time.sleep(1)
+                now = time.time()
+                dt = now - self.last_time
+                self.last_time = now
+                self.fps = 0.9 * self.fps + 0.1 * (1.0 / max(dt, 0.001))
+
+                # 1. Fetch Image
+                if self.cam_ok:
+                    frame = self.picam2.capture_array()
+                    self.safety.update_camera()
+                else:
+                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+                # 2. Vision Pipeline
+                perc_res = self.vision.process(frame, dt=dt)
+
+                # 3. IMU Dynamics
+                imu_yaw_rate = self.compute_yaw_rate(dt)
+
+                # 4. Control Logic (Vision + IMU stabilization)
+                ctrl_res = self.controller.compute(
+                    perc_res=perc_res,
+                    nav_state="NORMAL",
+                    velocity_ms=0.0,      # PWM-based control doesn't strictly need precise m/s
+                    dt=dt,
+                    base_speed=self.base_speed,
+                    imu_yaw_rate=imu_yaw_rate
+                )
+
+                # 5. Safety & Actuation
+                if self.safety.should_stop():
+                    speed_cmd = 0.0
+                    steer_cmd = 0.0
+                else:
+                    speed_cmd = ctrl_res.speed_pwm
+                    steer_cmd = ctrl_res.steer_angle_deg
+
+                if self.connected:
+                    self.serial.send_command("speed", str(int(speed_cmd)))
+                    self.serial.send_command("steer", str(int(steer_cmd * 10))) # Assuming API needs deg * 10
+
+                # 6. Render Dashboard
+                self.draw_dashboard(frame, perc_res, ctrl_res, imu_yaw_rate)
+
+                if cv2.waitKey(1) & 0xFF == 27: # ESC to quit
+                    break
+
         except KeyboardInterrupt:
-            pass
+            log.info("Interrupted by user.")
         finally:
-            orch._on_close()
+            self.stop()
+
+    def stop(self):
+        if self.connected:
+            self.serial.send_command("speed", "0")
+            self.serial.send_command("steer", "0")
+            self.serial.disconnect()
+        if self.cam_ok:
+            self.picam2.stop()
+        cv2.destroyAllWindows()
+        log.info("Pilot stopped safely.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="BFMC Vision+IMU Pilot")
+    parser.add_argument("--sim", action="store_true", help="Run without hardware")
+    args = parser.parse_args()
+
+    pilot = BFMC_Pilot(sim_mode=args.sim)
+    pilot.run()
