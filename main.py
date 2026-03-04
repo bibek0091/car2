@@ -1087,11 +1087,13 @@ class Orchestrator:
                 map_curvature  = 0.0
                 if self._planned_path and self.localizer.planner:
                     try:
+                        _curv_zone = getattr(self.localizer, 'current_zone', 'CITY')
+                        _curv_win  = 0.8 if _curv_zone == 'CITY' else 1.2
                         map_curvature = self.localizer.planner.get_path_curvature(
                             self.localizer.x, self.localizer.y,
                             self._planned_path,
                             cursor=self._path_cursor,
-                            window_m=1.0)
+                            window_m=_curv_win)
                     except Exception:
                         pass
 
@@ -1247,8 +1249,8 @@ class Orchestrator:
                                 f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
                                 (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
 
-                    if safety.should_stop():
-                        ctrl.speed_pwm = 0
+                    safety.update_encoder()   # stamp encoder liveness each pilot frame
+                    ctrl.speed_pwm *= safety.safe_speed_override()
 
                     self._last_ctrl = ctrl
 

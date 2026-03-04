@@ -206,20 +206,20 @@ class HardwareIO:
     # ── Encoder velocity ──────────────────────────────────────────────────────
 
     def get_velocity(self):
-        if hasattr(self.serial, "status") and \
-           hasattr(self.serial.status, "speed_mm_s") and \
-           self.serial.status.speed_mm_s is not None:
+        ENCODER_STALE_S = 0.5   # treat encoder as dead after 0.5 s silence
+        if (hasattr(self.serial, "status") and
+                hasattr(self.serial.status, "_speed_timestamp") and
+                (time.time() - self.serial.status._speed_timestamp) < ENCODER_STALE_S):
             return self.serial.status.speed_mm_s / 1000.0
 
+        # --- Fallback: open-loop PWM estimate ---
         pwm = self._last_cmd_speed
         if abs(pwm) <= self.DEADBAND_PWM:
             return 0.0
+        est = (abs(pwm) - self.DEADBAND_PWM) * self.SPEED_CALIB
+        result = min(est, self.MAX_SPEED_MS)
 
-        est_speed = (abs(pwm) - self.DEADBAND_PWM) * self.SPEED_CALIB
-        result = min(est_speed, self.MAX_SPEED_MS)
-
-        # Sim mode: apply a velocity EMA so position updates smoothly
-        # instead of jumping from 0 → est_speed in one frame
+        # Sim mode: EMA so position updates smoothly instead of 0 → est step
         if self.sim_mode:
             self._vel_filtered = 0.3 * result + 0.7 * self._vel_filtered
             return self._vel_filtered
@@ -229,13 +229,9 @@ class HardwareIO:
     def get_encoder_steer_deg(self):
         if self.sim_mode:
             return self._last_cmd_steer
-        try:
-            if hasattr(self.serial, 'get_feedback'):
-                return self.serial.get_feedback()[1]
-            return getattr(self.serial, '_feedback_steer', 0.0)
-        except Exception as e:
-            log.warning(f"get_encoder_steer_deg error: {e}")
-            return 0.0
+        if hasattr(self.serial, "status"):
+            return getattr(self.serial.status, "steering_angle", 0.0)
+        return 0.0
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 

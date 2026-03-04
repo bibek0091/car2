@@ -31,7 +31,7 @@ _ROUNDABOUT_CENTRES = [
     (4.94,  3.83),
     (15.48, 3.83),
 ]
-_ROUNDABOUT_RADIUS = 0.70   # A-04: tightened from 1.0 m — avoids misclassifying bypass nodes
+_ROUNDABOUT_RADIUS = 1.00   # diagnostic confirmed: ring nodes at 0.79–0.97m; bypass nodes start at 1.03m+
 
 
 class PathPlanner:
@@ -223,6 +223,9 @@ class PathPlanner:
 
     def get_path_curvature(self, current_x, current_y, path,
                            cursor=0, window_m=1.2):
+        """window_m: lookahead window for curvature sampling.
+        Pass 0.8 for CITY zone (tighter turns), keep 1.2 for HIGHWAY/PARKING.
+        """
         waypoints, _ = self.get_lookahead_waypoints(
             current_x, current_y, path, cursor=cursor, lookahead_m=window_m
         )
@@ -280,8 +283,8 @@ class PathPlanner:
         if not path or cursor >= len(path) - 1:
             return "STRAIGHT"
 
-        # FIX MAP-02: adaptive lookahead
-        la_m = max(2.5, velocity_ms * 6.0)
+        # Adaptive lookahead — shorter in city so junctions detected before car passes them
+        la_m = max(1.5, velocity_ms * 5.0)   # was max(2.5, 6.0) — ~3 nodes at 0.3 m/s
 
         waypoints, _ = self.get_lookahead_waypoints(
             current_x, current_y, path,

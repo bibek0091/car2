@@ -132,7 +132,7 @@ class HybridLaneTracker:
     WIDE_ROAD_PX             = 420   # full-road threshold (both lanes visible in BEV)
     SINGLE_LANE_PX           = 200   # minimum plausible single-lane width
     RIGHT_LANE_BIAS_PX       = -15   # target shifted LEFT of lane centre — buffer from right edge
-    DIVIDER_FOLLOW_OFFSET_PX =  80   # px right of divider when right edge is lost
+    DIVIDER_FOLLOW_OFFSET_PX = 130   # right-lane centre ~= half of SINGLE_LANE_PX
 
     def __init__(self, img_shape=(480, 640)):
         self.h, self.w = img_shape
@@ -258,14 +258,18 @@ class HybridLaneTracker:
         if has_right:
             if has_left:
                 if lane_width_px >= self.WIDE_ROAD_PX:
-                    # True midpoint between divider and outer edge — car sits in right-lane centre
-                    base_x = (ev(sl) + ev(sr)) / 2.0
+                    # Full road visible: sl = left outer edge, sr = right outer edge.
+                    # Right lane centre = 3/4 from left to right.
+                    base_x = ev(sl) + 0.75 * (ev(sr) - ev(sl))
                     anchor = "RL_WIDE_ROAD"
                 else:
                     base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
                     anchor = "RL_DUAL"
             else:
-                base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
+                # hw may be stale from a wide-road segment. Use SINGLE_LANE_PX
+                # as the safe estimate when only the outer edge is visible.
+                single_hw = self.SINGLE_LANE_PX / 2.0   # 200 / 2 = 100 px
+                base_x = ev(sr) - single_hw + self.RIGHT_LANE_BIAS_PX
                 anchor = "RL_FROM_EDGE"
         # ─ TIER 2: divider follow ────────────────────────────────────
         else:

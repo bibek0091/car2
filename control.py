@@ -86,8 +86,15 @@ class DividerGuard:
     centre line into oncoming traffic is worse than clipping the outer edge.
     """
 
+    # ── Sync with perception.py Tier-1 targets ──────────────────────────────
+    # DIVIDER_SAFE_PX should roughly equal DIVIDER_FOLLOW_OFFSET_PX (130 px) so
+    # the guard activates just before the Tier-2 divider-follow target.
+    # EDGE_SAFE_PX should be < (SINGLE_LANE_PX/2 - RIGHT_LANE_BIAS_PX) = 100 - (-15) = 115
+    # so the guard does NOT fire when the car is correctly centred in its lane.
+    # When adjusting perception.py constants, update these to match.
+    # ────────────────────────────────────────────────────────────────────────
     DIVIDER_SAFE_PX = 130   # raised from 110: stronger push away from centre divider
-    EDGE_SAFE_PX    = 100   # raised from 70: more buffer from right outer edge marking
+    EDGE_SAFE_PX    =  80   # reduced from 100: Tier-1 target already keeps car clear of right edge
     GAIN            = 0.35
     MAX_CORR        = 25.0
     DEADBAND_PX     =  2
@@ -132,7 +139,7 @@ class Controller:
     MED_CURV_THRESH  = 0.0010
 
     # Smooth curve braking parameters
-    BRAKING_DISTANCE_M = 1.2    # start braking later — less oscillation time
+    BRAKING_DISTANCE_M = 1.8    # was 1.2 — 6 extra frames for earlier braking
     MIN_CURVE_SPEED_F  = 0.62   # 62% of base — smoother, less dramatic slowdown
 
     def __init__(self):
@@ -142,7 +149,7 @@ class Controller:
         self._GUARD_EMA     = 0.3   # 0.3 = moderate smooth; lower for stickier
         self.stanley        = StanleyController(k=1.2, ks=0.2, wheelbase_m=0.23)
         self._straight_frames      = 0
-        self._STRAIGHT_BOOST_DELAY = 8   # frames (~0.27s) of straight before boost applies
+        self._STRAIGHT_BOOST_DELAY = 12  # was 8 frames — wait longer before boost on straights
 
     def compute(self, perc_res,
                 nav_state:      str   = "NORMAL",
@@ -202,7 +209,7 @@ class Controller:
             self._straight_frames = 0
 
         if self._straight_frames >= self._STRAIGHT_BOOST_DELAY:
-            speed = min(speed * 1.08, base_speed * 1.15)   # gentler boost, delayed
+            speed = min(speed * 1.04, base_speed * 1.08)   # gentler boost, less instability near next curve
 
         # 4c. Dead-reckoning speed penalty
         if "DEAD_RECKONING" in perc_res.anchor:
@@ -222,8 +229,8 @@ class Controller:
         final_speed = min(final_speed, max_speed)
 
         # F-10: minimum speed floor — prevents stacked multipliers stalling mid-track.
-        # 18 PWM = just above the 12 PWM deadband. Only applies in normal driving.
-        MINIMUM_DRIVE_PWM = 18.0
+        # 16 PWM = marginally above 12 PWM deadband; allows crawling through tight junctions.
+        MINIMUM_DRIVE_PWM = 16.0
         if nav_state not in ("SYS_STOP", "STOPPED") and final_speed > 0:
             final_speed = max(final_speed, MINIMUM_DRIVE_PWM)
 

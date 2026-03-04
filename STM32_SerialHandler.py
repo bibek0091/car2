@@ -37,6 +37,7 @@ class VehicleStatus:
     instant_current: float = 0.0
     imu_data: Optional[Dict] = None
     last_heartbeat: float = 0.0
+    _speed_timestamp: float = 0.0   # time.time() of last encoder speed update
 
 # ===================== MAIN CLASS =====================
 
@@ -182,8 +183,18 @@ class STM32_SerialHandler:
                     self.read_buffer += data.decode(errors="ignore")
 
                     while "\r\n" in self.read_buffer:
-                        line, self.read_buffer = self.read_buffer.split("\r\n", 1)
-                        self._process_line(line.strip())
+                            line, self.read_buffer = self.read_buffer.split("\r\n", 1)
+
+                            # DEBUG-SERIAL: log first 20 raw lines to verify
+                            # the actual STM32 response format.
+                            # Remove this block after confirming the format.
+                            if not hasattr(self, '_debug_count'):
+                                self._debug_count = 0
+                            if self._debug_count < 20:
+                                logger.debug(f"RAW STM32 LINE [{self._debug_count}]: {repr(line)}")
+                                self._debug_count += 1
+
+                            self._process_line(line.strip())
 
                 time.sleep(0.001)
 
@@ -194,13 +205,25 @@ class STM32_SerialHandler:
                 cb(str(e))
 
     def _process_line(self, line: str):
-        if line.startswith("TOTALV:"):
-            self.status.battery_voltage = float(line.split(":")[1])
-        elif line.startswith("INSTANT:"):
-            self.status.instant_current = float(line.split(":")[1])
-        elif line.startswith("speed:"):
-            value = line.split(":")[1]
-            self.status.speed_mm_s = float(value)
+        # BFMC telemetry frame: "#cmd:value;;"  (after \r\n split and strip)
+        line = line.strip().lstrip("#").rstrip(";")
+        if ":" not in line:
+            return
+        cmd, _, val = line.partition(":")
+        cmd = cmd.strip().lower()
+        val = val.strip()
+        try:
+            if cmd == "speed":
+                self.status.speed_mm_s    = float(val)
+                self.status._speed_timestamp = time.time()
+            elif cmd == "steer":
+                self.status.steering_angle = float(val) / 10.0
+            elif cmd == "totalv":
+                self.status.battery_voltage = float(val)
+            elif cmd == "instant":
+                self.status.instant_current = float(val)
+        except ValueError:
+            pass
 
     # ===================== VEHICLE COMMANDS =====================
 

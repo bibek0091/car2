@@ -324,12 +324,13 @@ class LocalizationEngine:
         # so we don't dead-reckon from (0,0) which is off the BFMC track.
         if not self._initialized:
             if camera_confidence > 0.5 and self.planner:
-                nn = self.planner.get_nearest_node(self.x, self.y)
-                if nn:
-                    px, py = self.planner.node_positions[nn]
-                    self.set_pose(px, py)
-                    log.info(f"F-03 auto-init: snapped to nearest node {nn} ({px:.2f}, {py:.2f})")
-            return   # always skip this frame after init attempt
+                # F-03 FIX: auto-snap to nearest(0,0) is always wrong on BFMC track.
+                # Require the operator to call set_pose() via map click or --start-node.
+                log.warning(
+                    "F-03: Localizer not initialized. "
+                    "Call set_pose(x, y, yaw_rad) before starting the run. "
+                    "Skipping auto-snap to avoid placing car at world-origin node.")
+            return   # do not dead-reckon from (0,0)
 
         with self._lock:
             # OPT: use optical_vel as velocity fallback when encoder is dead
@@ -342,10 +343,56 @@ class LocalizationEngine:
                 self._update_cursor_internal(path)
             cursor = self._path_cursor
 
-            if camera_confidence > 0.3:
-                heading_error = camera_heading_rad - self.yaw
-                self.yaw += np.clip(heading_error * 0.03, -0.02, 0.02)
+            # ── Layer 1: Camera Yaw-Rate Integration (LOC-A + LOC-B) ──────────
+            # LOC-A: only integrate when heading agreement is strong
+            if heading_conf > 0.35 and camera_confidence > 0.3:
+                raw_yaw_rate = 0.0
+                if self._prev_cam_heading is not None:
+                    raw_yaw_rate = (camera_heading_rad - self._prev_cam_heading) / max(dt, 0.001)
+                self._prev_cam_heading = camera_heading_rad
+
+                # LOC-B: dual-rate EMA — fast on turns, slow on straights
+                alpha = 0.30 if abs(raw_yaw_rate) > 0.3 else 0.12
+                self._cam_yaw_smoothed = alpha * raw_yaw_rate + (1.0 - alpha) * self._cam_yaw_smoothed
+                self.visual_yaw_rate = self._cam_yaw_smoothed
+
+                yaw_delta = np.clip(self._cam_yaw_smoothed * dt,
+                                    -self._MAX_CAM_YAW_CORRECTION,
+                                     self._MAX_CAM_YAW_CORRECTION)
+                self.yaw += yaw_delta
                 self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+
+                # LOC-C: absolute heading soft-fusion (long-run drift corrector)
+                abs_err = (camera_heading_rad - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                abs_corr = np.clip(abs_err * self._ABS_HEADING_GAIN,
+                                   -self._ABS_HEADING_MAX_CORR, self._ABS_HEADING_MAX_CORR)
+                self.yaw += abs_corr
+                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+            else:
+                self._prev_cam_heading = None   # reset on low-confidence frames
+
+            # OPT: optical_yaw_rate fallback (when camera has no lane lines)
+            if optical_yaw_rate != 0.0 and camera_confidence < 0.2:
+                opt_delta = np.clip(optical_yaw_rate * dt, -0.04, 0.04)
+                self.yaw += opt_delta
+                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+
+            # ── Layer 2: A* Path Heading Nudge ────────────────────────────────
+            # Prevents long-run yaw drift by gently aligning with map segment.
+            if (self._map_snap_enabled and self.planner and path
+                    and cursor < len(path) - 1
+                    and camera_confidence < 0.4):   # only when camera is uncertain
+                n1 = path[cursor]
+                n2 = path[min(cursor + 1, len(path) - 1)]
+                p1 = self.planner.node_positions.get(n1)
+                p2 = self.planner.node_positions.get(n2)
+                if p1 and p2:
+                    seg_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+                    nudge_err = (seg_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                    # Only nudge when car heading is close enough to path (< 30°)
+                    if abs(math.degrees(nudge_err)) < 30:
+                        self.yaw += np.clip(nudge_err * 0.02, -0.01, 0.01)
+                        self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 3: Forward Dead-Reckoning ──────────────────────────────
             v = self._last_speed_ms
