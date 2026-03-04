@@ -38,14 +38,10 @@ class LaneTuner:
     def __init__(self):
         cv2.namedWindow("Lane Tuner", cv2.WINDOW_NORMAL)
         cv2.createTrackbar("Right Divider Offset", "Lane Tuner", 40, 120, lambda x: None)
-        cv2.createTrackbar("Left Divider Offset",  "Lane Tuner",  0, 120, lambda x: None)
-        cv2.createTrackbar("Center Bias",          "Lane Tuner",  0,  80, lambda x: None)
 
     def read(self):
         right_offset = cv2.getTrackbarPos("Right Divider Offset", "Lane Tuner")
-        left_offset  = cv2.getTrackbarPos("Left Divider Offset",  "Lane Tuner")
-        center_bias  = cv2.getTrackbarPos("Center Bias",          "Lane Tuner")
-        return right_offset, left_offset, center_bias
+        return right_offset
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -421,33 +417,22 @@ class HybridLaneTracker:
 
     def get_target_x(self, y_eval, lane_width_px, extra_offset_px=0,
                      nav_state="NORMAL", frames_lost=0, last_speed=0.0, last_steering=0.0,
-                     right_offset=40, left_offset=0, center_bias=0):
+                     right_offset=40):
         sl, sr = self.sl, self.sr
         hw = lane_width_px / 2.0
 
         def ev(fit): return float(np.polyval(fit, y_eval))
 
         has_right = (sr is not None)
-        has_left  = (sl is not None)
 
-        if not has_right and not has_left:
+        if has_right:
+            # Always anchor to right lane regardless of whether left is visible
+            base_x = ev(sr) - right_offset
+            anchor = "RIGHT_ANCHOR"
+        else:
+            # Right lane not visible — do not use left lane, fall to dead reckoning
             predicted_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
             return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
-
-        if has_right and has_left:
-            center = (ev(sl) + ev(sr)) / 2.0
-            # FIX 1: use right_offset param — was hardcoded to 40, slider had no effect
-            right_limit = ev(sr) - right_offset
-            # FIX 2a: apply center_bias — was accepted but silently discarded
-            base_x = min(center, right_limit) + center_bias
-            anchor = "CENTER_BOTH"
-        elif has_right:
-            base_x = ev(sr) - hw - right_offset
-            anchor = "RIGHT_PRIORITY"
-        elif has_left:
-            # FIX 2b: apply left_offset — was accepted but silently discarded
-            base_x = ev(sl) + hw + left_offset
-            anchor = "LEFT_FALLBACK"
 
         self.dead_reckoner.last_valid_target    = base_x
         self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
@@ -550,8 +535,6 @@ class VisionPipeline:
 
         # Written by StandalonePilot each frame from tuner
         self.right_offset = 40
-        self.left_offset  = 0
-        self.center_bias  = 0
 
     def process(self, raw_frame, dt: float = 0.033, extra_offset_px=0.0,
                 nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
@@ -596,7 +579,7 @@ class VisionPipeline:
         target_x, anchor = self.tracker.get_target_x(
             y_eval, lw, extra_offset_px, nav_state, self.lost_frames,
             velocity_ms, last_steering,
-            self.right_offset, self.left_offset, self.center_bias
+            self.right_offset
         )
 
         if not hasattr(self, "_target_ema"):
@@ -830,10 +813,8 @@ class StandalonePilot:
 
         try:
             while self.running:
-                right_offset, left_offset, center_bias = self.tuner.read()
+                right_offset = self.tuner.read()
                 self.vision.right_offset = right_offset
-                self.vision.left_offset  = left_offset
-                self.vision.center_bias  = center_bias
 
                 ts          = time.time()
                 dt          = max(ts - t_prev, 0.001)
