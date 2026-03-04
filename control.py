@@ -54,7 +54,7 @@ class StanleyController:
                 velocity_ms: float, lane_width_px: float,
                 map_curvature: float = 0.0):
         """Returns (total_deg, reactive_deg, ff_deg) tuple for telemetry."""
-        ppm  = max(lane_width_px, 50) / 0.35    # pixels per metre
+        ppm  = max(lane_width_px, 50) / 0.45    # pixels per metre
         ce_m = (320.0 - target_x_px) / ppm      # cross-track error (metres)
 
         # F-04: velocity-scaled cross-track gain to prevent startup oscillation.
@@ -131,7 +131,7 @@ class DividerGuard:
 class Controller:
 
     MAX_STEER      = 45.0
-    MAX_STEER_RATE = 20.0
+    MAX_STEER_RATE = 5.0
 
     HIGH_CURV_THRESH = 0.0025
     MED_CURV_THRESH  = 0.0010
@@ -142,6 +142,7 @@ class Controller:
 
     def __init__(self):
         self.prev_steer     = 0.0
+        self.steer_filtered = 0.0
         self.guard          = DividerGuard()
         self._guard_spd_ema = 1.0   # EMA of guard speed multiplier
         self._GUARD_EMA     = 0.3   # 0.3 = moderate smooth; lower for stickier
@@ -231,6 +232,9 @@ class Controller:
         MINIMUM_DRIVE_PWM = 16.0
         if nav_state not in ("SYS_STOP", "STOPPED") and final_speed > 0:
             final_speed = max(final_speed, MINIMUM_DRIVE_PWM)
+
+        self.steer_filtered = 0.7 * self.steer_filtered + 0.3 * steer_angle
+        steer_angle = self.steer_filtered
 
         return ControlOutput(
             steer_angle_deg = steer_angle,

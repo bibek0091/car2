@@ -174,13 +174,11 @@ class LocalizationEngine:
             self._snap_miss_frames = 0
         log.info("Path cursor reset.")
 
-    def update_imu_yaw(self, yaw_rad: float):
-        """Soft-fuse IMU yaw at gain 0.15 per frame instead of hard overwriting.
-        A hard overwrite discards all Layer-1/LOC-C corrections every frame."""
+    def update_imu_yaw(self, imu_yaw: float):
         with self._lock:
-            heading_err = (yaw_rad - self.yaw + math.pi) % (2 * math.pi) - math.pi
-            self.yaw += np.clip(heading_err * 0.15, -0.05, 0.05)
-            self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+            yaw_error = imu_yaw - self.yaw
+            yaw_error = (yaw_error + math.pi) % (2 * math.pi) - math.pi
+            self.yaw += 0.2 * yaw_error
 
     def get_pose(self):
         with self._lock:
@@ -394,15 +392,15 @@ class LocalizationEngine:
                                           self._ABS_HEADING_MAX_CORR))
                 self.yaw += abs_corr
                 self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+
+                if heading_conf > 0.4:
+                    cam_error = camera_heading_rad - self.yaw
+                    cam_error = (cam_error + math.pi) % (2 * math.pi) - math.pi
+                    self.yaw += 0.05 * cam_error
+
             else:
                 self._prev_cam_heading = None   # reset on low-confidence frames
                 self.visual_yaw_rate   = 0.0
-
-            # OPT: optical_yaw_rate fallback when camera has no lane lines
-            if optical_yaw_rate != 0.0 and camera_confidence < 0.2:
-                opt_delta = float(np.clip(optical_yaw_rate * dt, -0.04, 0.04))
-                self.yaw += opt_delta
-                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 2: A* Path Heading Nudge (drift corrector) ──────────────────
             # Only active when camera is uncertain — prevents over-riding good vision.
@@ -416,30 +414,23 @@ class LocalizationEngine:
                 if p1 and p2:
                     seg_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
                     nudge_err = (seg_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
-                    if abs(math.degrees(nudge_err)) < 30:
-                        self.yaw += float(np.clip(nudge_err * 0.02, -0.01, 0.01))
+                    
+                    if abs(math.degrees(nudge_err)) > 20.0:
+                        self.yaw += 0.05 * nudge_err
                         self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 3: Forward Dead-Reckoning ──────────────────────────────
             v = self._last_speed_ms
             theta = self.yaw
-
-            expected_yaw_rate = v / self._WHEELBASE_M * math.tan(current_steer_rad)
-            imu_yaw_rate = (self.yaw - self._prev_yaw) / dt if hasattr(self, "_prev_yaw") else 0
-
-            if abs(expected_yaw_rate - imu_yaw_rate) > 1.0:
-                v *= 0.8
-
-            self._prev_yaw = self.yaw
-
             dt = max(dt, 1e-4)
 
-            # ── Layer 3: dead-reckoning (only when moving)
+            # Bicycle Model Dead-Reckoning
             if abs(v) >= 1e-4:
-                dx = v * math.cos(theta) * dt
-                dy = v * math.sin(theta) * dt
-                self.x += dx
-                self.y += dy
+                yaw_rate = v / self._WHEELBASE_M * math.tan(current_steer_rad)
+                self.x += v * math.cos(theta) * dt
+                self.y += v * math.sin(theta) * dt
+                self.yaw += yaw_rate * dt
+                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 4: Map Snap (Heading-Gated) ────────────────────────────
             if self._map_snap_enabled and self.planner:
@@ -613,7 +604,7 @@ class LocalizationEngine:
 
         snap_radius = (self._MAP_SNAP_RECOVERY_M
                        if self._snap_miss_frames >= self._SNAP_LOST_LIMIT
-                       else self._MAP_SNAP_RADIUS_M)
+                       else 0.5 + velocity * 0.5)
 
         best_dist   = float('inf')
         best_foot   = None

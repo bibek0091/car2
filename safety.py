@@ -23,7 +23,7 @@ class SafetySupervisor:
         now = time.time()
         if now - self.yolo_last > 2.0:       # was 0.5s — YOLO runs in background thread
             return True
-        if now - self.camera_last > 0.5:
+        if now - self.camera_last > 1.5:
             return True
         if now - self.serial_last > 0.5:
             return True

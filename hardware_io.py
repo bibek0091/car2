@@ -93,6 +93,10 @@ class HardwareIO:
                 self.camera = Picamera2()
                 cfg = self.camera.create_video_configuration(main={"size": (640, 480)})
                 self.camera.configure(cfg)
+                
+                # Lock exposure and gain
+                self.camera.set_controls({'AeEnable': False, 'ExposureTime': 20000, 'AnalogueGain': 2.0})
+
                 self.camera.start()
                 log.info("PiCamera2 initialized.")
                 threading.Thread(target=self._camera_worker, daemon=True,

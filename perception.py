@@ -10,6 +10,15 @@ import os
 from dataclasses import dataclass
 from collections import deque
 
+def validate_lane(lane_width, confidence, curvature):
+    if lane_width < 150 or lane_width > 500:
+        return False
+    if confidence < 0.25:
+        return False
+    if abs(curvature) > 0.02:
+        return False
+    return True
+
 @dataclass
 class PerceptionResult:
     warped_binary:     np.ndarray
@@ -77,7 +86,9 @@ class VisualOdometry:
             dx = good_new[:, 0] - good_old[:, 0]
             dy = good_new[:, 1] - good_old[:, 1]
             # Calibration: ~0.015 rad/s per px/frame lateral; 0.008 m/s per px/frame forward
-            yaw_rate = float(-np.median(dx) * 0.015 / dt)
+            # disabled optical yaw_rate dependence: 
+            # yaw_rate = float(-np.median(dx) * 0.015 / dt)
+            yaw_rate = 0.0
             vel      = float( np.median(dy) * 0.008 / dt)
 
         self.old_gray = gray.copy()
@@ -99,12 +110,16 @@ class DeadReckoningNavigator:
         self._lost_time_s += dt
 
     def predict_target(self, last_speed, last_steering):
-        """A-03: Uses wall-clock lost time, not frame count."""
+        """A-03: Uses bicycle model for lateral drift prediction."""
         t = max(0.0, self._lost_time_s)
-        lateral_drift   = last_steering * 2.0 * t
+        # Assuming last_steering is in radians and last_speed in m/s
+        yaw_rate_drift = last_speed / 0.23 * math.tan(last_steering) # 0.23m wheelbase approx
+        lateral_drift = last_speed * math.sin(yaw_rate_drift * t) * 500  # px scaling approx
+        
         predicted_target = self.last_valid_target + lateral_drift
         if abs(self.last_valid_curvature) > 0.001:
             predicted_target += self.last_valid_curvature * 5000 * t
+        predicted_target = float(np.clip(predicted_target, 150, 490))
         predicted_target = float(np.clip(predicted_target, 150, 490))
         confidence       = max(0.0, 1.0 - t / 2.0)   # full confidence lost after 2 s
         return predicted_target, confidence
@@ -149,6 +164,7 @@ class HybridLaneTracker:
         self.right_stale = 0
         self.dead_reckoner = DeadReckoningNavigator()
         self.estimated_lane_width = 280.0
+        self.target_history = deque(maxlen=5)
 
     def update(self, warped_binary, map_hint: str = "STRAIGHT"):
         nz  = warped_binary.nonzero()
@@ -236,60 +252,29 @@ class HybridLaneTracker:
                 else: return 320.0 - (lane_width_px * 0.8) + extra_offset_px, "JCT_LEFT_BLIND"
             return 320.0 + extra_offset_px, "JCT_WAITING_CHOICE"
 
-        # ── 3-TIER RIGHT-LANE PRIORITY SYSTEM ────────────────────────────────
-        #
-        #  TIER 1 — RIGHT LANE (sr visible): full right-lane targeting.
-        #    Both or right-edge-only visible; RIGHT_LANE_BIAS_PX comfort margin.
-        #
-        #  TIER 2 — DIVIDER FOLLOW (sr lost, sl visible):
-        #    Right edge gone — shadow the centre dashed divider at a safe fixed
-        #    offset (DIVIDER_FOLLOW_OFFSET_PX). Speed cut 25% in control.py.
-        #    Tier 1 resumes the instant sr reappears.
-        #
-        #  TIER 3 — DEAD RECKONING (both lost): drift model.
-
-        has_right = (sr is not None)
-        has_left  = (sl is not None)
-
-        # ─ TIER 3: both lost ────────────────────────────────────────
-        if not has_right and not has_left:
-            predicted_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
-            return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
-
-        # ─ TIER 1: sr visible ────────────────────────────────────────
-        if has_right:
-            if has_left:
-                if lane_width_px >= self.WIDE_ROAD_PX:
-                    # Full road visible: sl = left outer edge, sr = right outer edge.
-                    # Right lane centre = 3/4 from left to right.
-                    base_x = ev(sl) + 0.75 * (ev(sr) - ev(sl))
-                    anchor = "RL_WIDE_ROAD"
-                else:
-                    base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
-                    anchor = "RL_DUAL"
-            else:
-                # sr visible, sl not. Use fixed half-lane estimate (not stale EMA width).
-                single_hw = self.SINGLE_LANE_PX / 2.0   # 200 / 2 = 100 px
-                base_x = ev(sr) - single_hw + self.RIGHT_LANE_BIAS_PX
-                # Graduated blend toward image centre as sr goes stale.
-                # Prevents the frozen polynomial position from causing a sudden
-                # jump when it is finally cleared at STALE_FIT_FRAMES.
-                if self.right_stale > 1:
-                    blend = min(1.0, self.right_stale / float(self.STALE_FIT_FRAMES))
-                    base_x = base_x * (1.0 - blend) + 320.0 * blend
-                anchor = "RL_FROM_EDGE"
-        # ─ TIER 2: divider follow ────────────────────────────────────
-        else:
-            # sr gone — target 155px right of centre divider.
-            # Floor clamp at 290px: sl drifts left on curves, without clamp
-            # the target chases sl and the car steers off the lane.
-            base_x = max(ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX, 290.0)
+        if sl is not None and sr is not None:
+            base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
+            anchor = "RL_DUAL"
+        elif sr is not None:
+            base_x = ev(sr) - self.SINGLE_LANE_PX / 2.0
+            anchor = "RL_FROM_EDGE"
+        elif sl is not None:
+            base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
             anchor = "DIVIDER_FOLLOW"
+        else:
+            predicted_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
+            self.target_history.append(predicted_x)
+            smoothed_target = np.median(self.target_history)
+            return smoothed_target + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
 
         self.dead_reckoner.last_valid_target    = base_x
         self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
         self.dead_reckoner.reset_lost_timer()
-        return base_x + extra_offset_px, anchor
+
+        self.target_history.append(base_x)
+        smoothed_target = np.median(self.target_history)
+
+        return smoothed_target + extra_offset_px, anchor
 
     def get_curvature(self, y_eval):
         fit = self.sr if self.sr is not None else self.sl
@@ -444,6 +429,16 @@ class VisionPipeline:
         y_eval = 400.0
         lw = self.tracker.estimated_lane_width
         
+        # Confidence & Curvature Formatting
+        curv = self.tracker.get_curvature(y_eval)
+        conf = 1.0 if (sl is not None and sr is not None) else 0.5 if (sl is not None or sr is not None) else 0.0
+
+        if not validate_lane(lw, conf, curv):
+            sl, sr = None, None
+            self.tracker.sl, self.tracker.sr = None, None
+            conf = 0.0
+            curv = 0.0
+
         # Determine Target
         target_x, anchor = self.tracker.get_target_x(
             y_eval, lw, extra_offset_px, nav_state, self.lost_frames,
@@ -460,10 +455,6 @@ class VisionPipeline:
             self.lost_frames = 0
             self.last_target_x = target_x
             self.tracker.dead_reckoner.reset_lost_timer()
-
-        # Confidence & Curvature Formatting
-        curv = self.tracker.get_curvature(y_eval)
-        conf = 1.0 if (sl is not None and sr is not None) else 0.5 if (sl is not None or sr is not None) else 0.0
         
         # F-02: heading averaged from BOTH lane lines when available
         # Left-only heading is unreliable when sl has a noisy 2nd-order coefficient.

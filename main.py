@@ -1301,7 +1301,7 @@ class Orchestrator:
                     # IMU correction runs AFTER dead-reckoning, not before.
                     # This way IMU corrects the result of all layers, not just
                     # the opening state that Layers 1-4 then override.
-                    imu_yaw = imu.get_yaw()
+                    imu_yaw = imu.read_yaw()
                     self.localizer.update_imu_yaw(imu_yaw)
 
                     self.localizer.get_upcoming_curve_from_path(
