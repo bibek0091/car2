@@ -9,6 +9,7 @@ class BNO055_IMU:
 
     def __init__(self, bus_num=1):
         self.bus = smbus.SMBus(bus_num)
+        self._yaw_offset = 0.0
         self._initialize_sensor()
 
     def _write_reg(self, reg, value):
@@ -62,11 +63,21 @@ class BNO055_IMU:
 
         return heading, roll, pitch
 
-    def read_yaw(self):
+    def start(self):
+        """No-op — sensor is initialised in __init__. Exists for API compatibility."""
+        pass
 
+    def get_yaw(self) -> float:
+        """Returns current yaw in radians (same as read_yaw)."""
+        return self.read_yaw()
+
+    def set_offset(self, offset_rad: float):
+        """Stores a heading offset applied to all subsequent get_yaw() calls."""
+        self._yaw_offset = offset_rad
+
+    def read_yaw(self) -> float:
         heading, _, _ = self.read_orientation()
-
-        return math.radians(heading)
+        return math.radians(heading) + getattr(self, '_yaw_offset', 0.0)
 
 
 # ---------------------------

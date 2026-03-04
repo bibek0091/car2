@@ -959,8 +959,7 @@ class Orchestrator:
                     except Exception:
                         pass
 
-                if not self._estop:
-                    self._fps = 0.7*self._fps + 0.3*(1.0/dt)
+                self._fps = 0.7*self._fps + 0.3*(1.0/dt)
 
                 # --- TRAFFIC ENGINE (runs even in E-STOP for YOLO feed) ---
                 if self.traffic_engine:

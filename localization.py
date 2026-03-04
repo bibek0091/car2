@@ -101,6 +101,7 @@ class LocalizationEngine:
         self.x   = 0.0
         self.y   = 0.0
         self.yaw = 0.0
+        self._prev_yaw = 0.0
         self.visual_yaw_rate = 0.0   # rad/s — exposed to controller
 
         self._lock = threading.RLock()
@@ -167,8 +168,12 @@ class LocalizationEngine:
         log.info("Path cursor reset.")
 
     def update_imu_yaw(self, yaw_rad: float):
+        """Soft-fuse IMU yaw at gain 0.15 per frame instead of hard overwriting.
+        A hard overwrite discards all Layer-1/LOC-C corrections every frame."""
         with self._lock:
-            self.yaw = yaw_rad
+            heading_err = (yaw_rad - self.yaw + math.pi) % (2 * math.pi) - math.pi
+            self.yaw += np.clip(heading_err * 0.15, -0.05, 0.05)
+            self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
     def get_pose(self):
         with self._lock:
@@ -354,20 +359,18 @@ class LocalizationEngine:
 
             self._prev_yaw = self.yaw
 
-            if abs(v) < 1e-4:
-                return
-
             dt = max(dt, 1e-4)
 
-            dx = v * math.cos(theta) * dt
-            dy = v * math.sin(theta) * dt
-
-            self.x += dx
-            self.y += dy
+            # ── Layer 3: dead-reckoning (only when moving)
+            if abs(v) >= 1e-4:
+                dx = v * math.cos(theta) * dt
+                dy = v * math.sin(theta) * dt
+                self.x += dx
+                self.y += dy
 
             # ── Layer 4: Map Snap (Heading-Gated) ────────────────────────────
             if self._map_snap_enabled and self.planner:
-                self._apply_map_snap_gated(effective_v, dt, camera_confidence,
+                self._apply_map_snap_gated(v, dt, camera_confidence,
                                            path, cursor)
                 self.current_zone = self.planner.get_zone(self.x, self.y)
 

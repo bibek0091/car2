@@ -258,7 +258,8 @@ class HybridLaneTracker:
         if has_right:
             if has_left:
                 if lane_width_px >= self.WIDE_ROAD_PX:
-                    base_x = (ev(sl) + 3.0 * ev(sr)) / 4.0
+                    # True midpoint between divider and outer edge — car sits in right-lane centre
+                    base_x = (ev(sl) + ev(sr)) / 2.0
                     anchor = "RL_WIDE_ROAD"
                 else:
                     base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
@@ -356,7 +357,7 @@ class HybridLaneTracker:
         # F-06: tightened from 80<w<560 to 180<w<420
         # BFMC lanes are ~280-350 px wide in BEV. 560 was accepting cross-lane noise.
         w = np.polyval(rf, y) - np.polyval(lf, y)
-        return 180 < w < 420
+        return 180 < w < 520   # upper bound must exceed WIDE_ROAD_PX (420) to accept full-road detec
 
     def _ema(self, prev, new, alpha=None):
         if alpha is None:
@@ -455,6 +456,21 @@ class VisionPipeline:
         elif sr is not None:
             heading_rad = _lane_heading(sr, y_eval)
 
+        # Compute heading_conf from agreement between the two lane-line tangents.
+        # When both lines are present, it is the cosine similarity of their heading vectors.
+        # When only one is present, it falls back to 0.4 (partial confidence).
+        # When neither is present, it is 0.0.
+        if sl is not None and sr is not None:
+            h_sl = _lane_heading(sl, y_eval)
+            h_sr = _lane_heading(sr, y_eval)
+            angle_diff = abs((h_sl - h_sr + math.pi) % (2 * math.pi) - math.pi)
+            # Perfect agreement (diff=0) → 1.0; 30° apart → ~0.5; >45° → near 0
+            heading_conf = max(0.0, 1.0 - angle_diff / math.radians(45))
+        elif sl is not None or sr is not None:
+            heading_conf = 0.4
+        else:
+            heading_conf = 0.0
+
         return PerceptionResult(
             warped_binary=warped_binary,
             lane_dbg=line_dbg,
@@ -466,7 +482,7 @@ class VisionPipeline:
             lane_width_px=lw,
             curvature=curv,
             heading_rad=heading_rad,
-            heading_conf=conf,
+            heading_conf=heading_conf,
             y_eval=y_eval,
             optical_yaw_rate=opt_yaw_rate,
             optical_vel=opt_vel,
