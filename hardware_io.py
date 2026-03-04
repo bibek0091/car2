@@ -91,19 +91,10 @@ class HardwareIO:
         elif not self.sim_mode and _CAM_AVAILABLE:
             try:
                 self.camera = Picamera2()
-                cfg = self.camera.create_video_configuration(
-                    main={"size": (1280, 720), "format": "XRGB8888"},
-                    controls={
-                        "AwbEnable":   False,
-                        "ColourGains": (3.5, 1.2),
-                        "AeEnable":    True,
-                        "Saturation":  1.4,
-                        "Sharpness":   1.2,
-                    }
-                )
+                cfg = self.camera.create_video_configuration(main={"size": (640, 480)})
                 self.camera.configure(cfg)
                 self.camera.start()
-                log.info("PiCamera2 initialized with manual ColourGains.")
+                log.info("PiCamera2 initialized.")
                 threading.Thread(target=self._camera_worker, daemon=True,
                                  name="camera_worker").start()
             except Exception as e:
@@ -131,14 +122,10 @@ class HardwareIO:
         """
         while self._running:
             try:
-                frame = self.camera.capture_array()   # blocks until new frame ready
+                frame = self.camera.capture_array()
                 if frame is not None and _CV2_AVAILABLE:
-                    # XRGB8888 → BGR
-                    if frame.ndim == 3 and frame.shape[2] == 4:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    else:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    self._push_frame(cv2.resize(frame, (640, 480)))
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    self._push_frame(frame)
             except Exception as e:
                 log.warning(f"Camera worker error: {e}")
                 time.sleep(0.033)   # brief pause only on error, then retry
