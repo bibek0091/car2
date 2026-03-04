@@ -5,6 +5,8 @@ Modifications:
   - ADDED: Calibration warmup phase to let camera exposure settle.
   - TWEAK: Adjusted offsets to keep car away from the right lane edge.
   - TWEAK: Increased right-edge guard distance for safety.
+  - FIX: Added a 5-second auto-start to calibration for headless setups.
+  - FIX: Added terminal warnings when car stops due to lost lane.
 """
 
 import cv2
@@ -588,23 +590,27 @@ class BFMC_Pilot:
         print("1. Place the car in the lane.")
         print("2. Let the camera auto-exposure adjust for a few seconds.")
         print("3. Ensure the lane lines are highlighted in Yellow and Cyan.")
-        print("4. Press 'C' to start the vehicle, or 'Q' to quit.\n")
+        print("4. Auto-starting in 5 seconds (or press 'C' to start now)...\n")
 
+        start_t = time.time()
         while True:
             if self.cam_ok:
                 frame = self.picam2.capture_array()
             else:
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "SIM MODE - Press C", (180, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(frame, "SIM MODE", (180, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
             warped = self._get_bev(frame)
             
             # Update tracker to build up EMA memory of polynomials before moving
             sl, sr, dbg, _ = self.tracker.update(warped)
+            
+            elapsed_time = time.time() - start_t
+            remaining_time = max(0, 5.0 - elapsed_time)
 
             cv2.putText(dbg, "--- CALIBRATION WARM-UP ---", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(dbg, "Adjust car & wait for stable lines.", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            cv2.putText(dbg, "Press 'C' to Start", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(dbg, f"Auto-starting in {remaining_time:.1f}s", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(dbg, "Press 'C' to Start now", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
             self._draw_poly(dbg, sl, (255, 220, 0))    # divider
             self._draw_poly(dbg, sr, (0,   200, 255))  # edge
@@ -612,8 +618,10 @@ class BFMC_Pilot:
             cv2.imshow("BFMC_v2", dbg)
 
             key = cv2.waitKey(30) & 0xFF
-            if key == ord('c'):
-                print("Calibration complete. Proceeding to autonomous mode...")
+            
+            # Auto-proceed after 5 seconds OR if 'C' is manually pressed
+            if key == ord('c') or remaining_time == 0:
+                print("\n--> Calibration complete. Proceeding to autonomous mode...")
                 break
             elif key == ord('q'):
                 self.stop()
@@ -626,6 +634,8 @@ class BFMC_Pilot:
         print("BFMC Pilot v2: STARTING — RIGHT LANE DRIVING MODE")
         if self.sim_mode:
             print("  [SIMULATION MODE — no camera, no serial]")
+        if not self.connected and not self.sim_mode:
+            log.warning("Serial connection is FALSE - Check wiring to STM32!")
 
         # 1. Run calibration first!
         self.calibrate()
@@ -730,6 +740,9 @@ class BFMC_Pilot:
 
                 if self.lost_frames > LOST_GRACE_FRAMES:
                     speed = 0.0
+                    # Log to the terminal so the user knows exactly WHY it's not moving
+                    if self.lost_frames % 30 == 0: 
+                        log.warning("CAR STOPPED: Lane tracking completely lost.")
                 elif base_speed == 0:
                     speed = 0.0
                 elif nav_state == "ROUNDABOUT":
@@ -757,8 +770,12 @@ class BFMC_Pilot:
 
                 # --- Actuate ---
                 if self.connected:
-                    self.handler.set_speed(speed)
-                    self.handler.set_steering(steer_angle)
+                    try:
+                        # Safely cast to float for the serial handler
+                        self.handler.set_speed(float(speed))
+                        self.handler.set_steering(float(steer_angle))
+                    except Exception as e:
+                        log.error(f"Serial Handler Error: {e}")
 
                 # --- Visualisation ---
                 self._draw_poly(dbg, sl, (255, 220, 0))    # divider  = yellow
