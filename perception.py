@@ -125,7 +125,68 @@ class DeadReckoningNavigator:
         return predicted_target, confidence
 
 
+
+class PredictiveLaneTracker:
+    """Bicycle-model lane predictor for when lane markings disappear temporarily."""
+    WHEELBASE = 0.23  # metres
+
+    def __init__(self):
+        self.last_target    = 320.0
+        self.last_curvature = 0.0
+        self.lost_time      = 0.0
+
+    def predict(self, speed_ms: float, steering_rad: float, dt: float) -> float:
+        """Returns predicted pixel target_x using bicycle kinematics."""
+        yaw_rate = speed_ms / self.WHEELBASE * math.tan(steering_rad)
+        lateral_shift = speed_ms * math.sin(yaw_rate * self.lost_time)
+        predicted = self.last_target + lateral_shift * 500
+        predicted = float(np.clip(predicted, 150, 490))
+        self.lost_time += dt
+        return predicted
+
+    def update(self, target_x: float, curvature: float = 0.0):
+        """Call each frame when lanes are visible to keep state fresh."""
+        self.last_target    = target_x
+        self.last_curvature = curvature
+        self.lost_time      = 0.0
+
+
+class KalmanLaneTracker:
+    """
+    Per-lane Kalman filter over the polynomial coefficients [a, b, c]
+    for the standard quadratic fit x = a*y² + b*y + c.
+    Use one instance per lane line (left / right).
+    """
+    def __init__(self):
+        self.state = np.zeros((3, 1))          # [a, b, c]^T
+        self.P     = np.eye(3) * 10.0          # initial covariance
+        self.Q     = np.eye(3) * 0.01          # process noise
+        self.R     = np.eye(3) * 5.0           # measurement noise
+
+    def predict(self):
+        """Propagate state forward one timestep (no control input)."""
+        self.P = self.P + self.Q
+
+    def update(self, measurement):
+        """
+        Fuse a new polynomial measurement [a, b, c].
+        measurement: array-like of length 3
+        """
+        z = np.array(measurement, dtype=float).reshape(3, 1)
+        H = np.eye(3)
+        y  = z - H @ self.state
+        S  = H @ self.P @ H.T + self.R
+        K  = self.P @ H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ y
+        self.P     = (np.eye(3) - K @ H) @ self.P
+
+    def get_lane(self) -> np.ndarray:
+        """Return smoothed polynomial coefficients [a, b, c]."""
+        return self.state.flatten()
+
+
 class HybridLaneTracker:
+
     NWINDOWS         = 9
     SW_MARGIN        = 60
     MINPIX           = 50
@@ -165,6 +226,11 @@ class HybridLaneTracker:
         self.dead_reckoner = DeadReckoningNavigator()
         self.estimated_lane_width = 280.0
         self.target_history = deque(maxlen=5)
+        # ── Kalman smoothers, one per lane line ────────────────────────────────
+        self.kf_left  = KalmanLaneTracker()
+        self.kf_right = KalmanLaneTracker()
+        # ── Kinematics-based target predictor ─────────────────────────────────
+        self.predictor = PredictiveLaneTracker()
 
     def update(self, warped_binary, map_hint: str = "STRAIGHT"):
         nz  = warped_binary.nonzero()
@@ -194,24 +260,37 @@ class HybridLaneTracker:
             # F-12: adaptive EMA — faster on curves for responsive tracking
             curv_now = self.get_curvature(self.h // 2)
             alpha = self.EMA_ALPHA_TURN if curv_now > 0.002 else self.EMA_ALPHA
-            self.sl        = self._ema(self.sl, fl, alpha)
+            self.sl         = self._ema(self.sl, fl, alpha)
             self.left_stale = 0
+            # Kalman fuse: smooth polynomial over time
+            self.kf_left.update(self.sl)
+            self.sl = self.kf_left.get_lane()
         else:
             self.left_stale += 1
             if self.left_stale > self.STALE_FIT_FRAMES:
                 self.left_fit, self.sl = None, None
+            elif self.sl is not None:
+                # propagate Kalman without a measurement
+                self.kf_left.predict()
+                self.sl = self.kf_left.get_lane()
 
         if has_r:
             fr = np.polyfit(nzy[ri], nzx[ri], 2)
             self.right_fit  = fr
             curv_now = self.get_curvature(self.h // 2)
             alpha = self.EMA_ALPHA_TURN if curv_now > 0.002 else self.EMA_ALPHA
-            self.sr         = self._ema(self.sr, fr, alpha)
+            self.sr          = self._ema(self.sr, fr, alpha)
             self.right_stale = 0
+            # Kalman fuse
+            self.kf_right.update(self.sr)
+            self.sr = self.kf_right.get_lane()
         else:
             self.right_stale += 1
             if self.right_stale > self.STALE_FIT_FRAMES:
                 self.right_fit, self.sr = None, None
+            elif self.sr is not None:
+                self.kf_right.predict()
+                self.sr = self.kf_right.get_lane()
 
         if has_l and has_r:
             if not self._width_sane(self.left_fit, self.right_fit):
