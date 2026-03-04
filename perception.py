@@ -381,6 +381,11 @@ class VisionPipeline:
         self.lost_frames = 0
         self.last_target_x = 320.0
 
+    def update_bev_transform(self, src_pts):
+        """Called after visual calibration to update the BEV warp matrix."""
+        self.SRC_PTS = np.float32(src_pts)
+        self.M_forward = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
+
     def process(self, raw_frame, dt: float = 0.033, extra_offset_px=0.0,
                 nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
                 upcoming_curve: str = "STRAIGHT",

@@ -151,7 +151,13 @@ class HardwareIO:
         try:
             return self._frame_queue.get_nowait()
         except queue.Empty:
-            return np.zeros((480, 640, 3), dtype=np.uint8)
+            blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            if self.sim_mode and self.video_cap is None:
+                cv2.putText(blank, "SIM MODE — NO VIDEO SOURCE",
+                            (80, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 180), 2)
+                cv2.putText(blank, "Pass --sim-video <path> to see frames",
+                            (70, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 60, 120), 1)
+            return blank
 
     def capture_frame(self):
         return self.read_camera()

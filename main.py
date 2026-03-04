@@ -102,7 +102,7 @@ log = logging.getLogger("main")
 
 TARGET_FPS   = 30
 FRAME_PERIOD = 1.0 / TARGET_FPS
-PWM_DEADBAND = 14.0
+PWM_DEADBAND = 12.0   # must match HardwareIO.DEADBAND_PWM exactly
 _SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 SVG_PATH_DEFAULT = os.path.join(_SCRIPT_DIR, "Track.svg")
 MAP_W_M = 22.0
@@ -503,7 +503,14 @@ def _draw_telemetry_panel(steer, speed_pwm, lat_err, conf, anchor,
     _lbl(img,f"CURV: {curvature:.5f}",200,185,scale=0.37,color=curvc)
 
     fpsc = C_GREEN if fps>=25 else (C_AMBER if fps>=18 else C_RED)
-    _lbl(img,f"FPS: {fps:.1f}" + ("  !! LOW" if fps<18 else ""),200,207,scale=0.44,color=fpsc)
+    _lbl(img, f"LOOP: {fps:.1f} Hz" + ("  !! LOW" if fps < 18 else "  OK"), 200, 207, scale=0.44, color=fpsc)
+
+    # Explicit m/s speed readout in large text so it is always readable at a glance
+    cv2.line(img, (195, 260), (w-10, 260), (40, 40, 40), 1)
+    spd_col = C_GREEN if velocity_ms > 0.05 else C_AMBER
+    cv2.putText(img, f"{velocity_ms:.3f} m/s", (200, 310),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.80, spd_col, 2, cv2.LINE_AA)
+    _lbl(img, "VEHICLE SPEED", 200, 295, scale=0.34, color=(100, 100, 100))
 
     nc = C_GREEN if nav_state=="NORMAL" else (C_AMBER if "JUNCTION" in nav_state else C_CYAN)
     _lbl(img,f"NAV: {nav_state}",200,227,scale=0.37,color=nc)
@@ -525,7 +532,13 @@ def _draw_telemetry_panel(steer, speed_pwm, lat_err, conf, anchor,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _annotate_bev(perc, ctrl):
-    dbg = perc.lane_dbg.copy() if perc.lane_dbg is not None else np.zeros((480,640,3),np.uint8)
+    if perc is None:
+        return np.zeros((480, 640, 3), np.uint8)
+    dbg = perc.lane_dbg.copy() if perc.lane_dbg is not None \
+          else np.zeros((480, 640, 3), np.uint8)
+    if perc.warped_binary is not None and not perc.warped_binary.any():
+        cv2.putText(dbg, "BEV: ZERO WHITE PIXELS — CHECK SRC_PTS CALIBRATION",
+                    (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1)
 
     def draw_poly(fit, color):
         if fit is None: return
@@ -577,7 +590,7 @@ def _status_bar(w, estop, fps, zone, nav_state, upcoming_curve, curve_dist_m,
     img = np.full((32, w, 3), 28, np.uint8)
     _badge(img," E-STOP " if estop else " RUNNING ",4,22,
            (0,0,170) if estop else (30,120,30), w=76)
-    _badge(img,f" {fps:.0f}fps ",90,22,
+    _badge(img, f" {fps:.0f}Hz ", 90, 22,
            (30,120,30) if fps>=25 else ((30,100,160) if fps>=18 else (0,0,160)), w=62)
     zc = {"CITY":(40,100,40),"HIGHWAY":(130,55,20),"PARKING":(25,80,140)}.get(zone,(60,60,60))
     _badge(img,f" {zone} ",162,22,zc,w=80)
@@ -664,6 +677,16 @@ class Orchestrator:
         self._blocked_nodes = {}
 
         self.vision         = VisionPipeline()
+        from perception import PerceptionResult
+        import numpy as _np
+        self._last_perc = PerceptionResult(
+            warped_binary=_np.zeros((480,640), dtype=_np.uint8),
+            lane_dbg=_np.zeros((480,640,3), dtype=_np.uint8),
+            sl=None, sr=None,
+            target_x=320.0, lateral_error_px=0.0,
+            anchor="INIT", confidence=0.0,
+            lane_width_px=280.0, curvature=0.0,
+        )
         try:
             if _TRAFFIC_AVAILABLE:
                 self._threaded_yolo = ThreadedYOLODetector("best.pt")
@@ -680,7 +703,6 @@ class Orchestrator:
         self._fps        = 0.0
         self._nav_state  = "NORMAL"
         self._last_ctrl  = ControlOutput(0.0, 0.0, 320.0, "INIT", 200)
-        self._last_perc  = None
         self._last_conf  = 0.0
         self._last_t_res = None
         self._sign_history = deque(maxlen=20)
@@ -826,17 +848,34 @@ class Orchestrator:
 
             try:
                 yi = self._q_yolo.get_nowait()
-                yi = cv2.resize(yi,(self.CAM_W,self.CAM_H))
-                self._yolo_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(yi,cv2.COLOR_BGR2RGB)))
-                self._yolo_label.config(image=self._yolo_ph)
-            except queue.Empty: pass
+            except queue.Empty:
+                # Pilot not running yet — show live camera preview so panel is never blank
+                if hasattr(self, 'hw'):
+                    yi = self.hw.read_camera()
+                    if yi is None or not yi.any():
+                        yi = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+                        cv2.putText(yi, "WAITING FOR CAMERA...", (60, 240),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 2)
+                else:
+                    yi = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+
+            yi = cv2.resize(yi,(self.CAM_W,self.CAM_H))
+            self._yolo_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(yi,cv2.COLOR_BGR2RGB)))
+            self._yolo_label.config(image=self._yolo_ph)
 
             try:
                 bi = self._q_bev.get_nowait()
-                bi = cv2.resize(bi,(self.CAM_W,self.CAM_H))
-                self._bev_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(bi,cv2.COLOR_BGR2RGB)))
-                self._bev_label.config(image=self._bev_ph)
-            except queue.Empty: pass
+            except queue.Empty:
+                if getattr(self, '_last_perc', None) is not None:
+                    bi = _annotate_bev(self._last_perc, getattr(self, '_last_ctrl', None))
+                else:
+                    bi = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+                    cv2.putText(bi, "BEV NOT READY", (160, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 60), 2)
+
+            bi = cv2.resize(bi,(self.CAM_W,self.CAM_H))
+            self._bev_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(bi,cv2.COLOR_BGR2RGB)))
+            self._bev_label.config(image=self._bev_ph)
 
             try:
                 li = self._q_loc.get_nowait()
@@ -854,7 +893,7 @@ class Orchestrator:
 
             ctrl  = self._last_ctrl
             perc  = self._last_perc
-            vm    = loc_data.get("speed_ms",0.0)
+            vm    = self.hw.get_velocity() if self.running else loc_data.get("speed_ms",0.0)
             ti = _draw_telemetry_panel(
                 steer         = ctrl.steer_angle_deg,
                 speed_pwm     = ctrl.speed_pwm,
@@ -866,8 +905,8 @@ class Orchestrator:
                 fps           = self._fps,
                 sign_history  = list(self._sign_history),
                 nav_state     = self._nav_state,
-                l_conf        = perc.confidence if perc else 0.0,
-                r_conf        = perc.confidence if perc else 0.0,
+                l_conf        = (1.0 if (perc and perc.sl is not None) else 0.0),
+                r_conf        = (1.0 if (perc and perc.sr is not None) else 0.0),
                 curvature     = perc.curvature if perc else 0.0,
                 velocity_ms   = vm,
                 w=self.TEL_W, h=self.TEL_H)
@@ -898,7 +937,7 @@ class Orchestrator:
         from safety import SafetySupervisor
         calib = VisualCalibrator(self.localizer.planner, self.localizer, self.vision)
         calibration_done = False
-        safety = SafetySupervisor()
+        safety = SafetySupervisor()   # created AFTER IMU init so timers start fresh
 
         try:
             while self.running:
@@ -912,8 +951,7 @@ class Orchestrator:
                 elif raw_frame.any():
                     safety.update_camera()
                 velocity_ms = self.hw.get_velocity()
-                if getattr(self.hw.serial, 'running', True):
-                    safety.update_serial()
+                safety.update_serial()   # always update — serial health checked separately
 
                 if not calibration_done:
                     calib.add_frame(raw_frame)
@@ -922,17 +960,21 @@ class Orchestrator:
                     self.hw.set_steering(0)
                     
                     if elapsed_run > 3.0:
-                        result = calib.finalize()
-                        if result.success:
-                            self.vision.update_bev_transform(result.src_pts)
-                            initial_heading_rad = math.radians(result.initial_heading_deg)
-                            self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
-                            
-                            imu_heading = imu.get_yaw()
-                            imu_offset = initial_heading_rad - imu_heading
-                            imu.set_offset(imu_offset)
-                            self._sv_hint.set("Pilot running…")
-                        calibration_done = True
+                        try:
+                            result = calib.finalize()
+                            if result.success:
+                                self.vision.update_bev_transform(result.src_pts)
+                                initial_heading_rad = math.radians(result.initial_heading_deg)
+                                self.localizer.set_pose(self.localizer.x, self.localizer.y, initial_heading_rad)
+                                imu_heading = imu.get_yaw()
+                                imu.set_offset(initial_heading_rad - imu_heading)
+                                self._sv_hint.set("Pilot running…")
+                            else:
+                                log.warning("Visual calibration failed — using default BEV transform and zero heading")
+                        except Exception as e:
+                            log.error(f"Calibration finalize() exception: {e} — proceeding with defaults")
+                        finally:
+                            calibration_done = True   # ALWAYS exit calibration phase after elapsed_run > 3.0
                     
                     # Keep dashboard updated during calibration
                     self._last_perc = self.vision.process(raw_frame)
@@ -1096,17 +1138,18 @@ class Orchestrator:
                     # --- STARTUP CALIBRATION OVERRIDE ---
                     # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
                     # Stage 2 (3-6 s): crawl at ≤15 PWM — warm up EMA lane tracker.
-                    if elapsed_run < 3.0:
-                        ctrl.speed_pwm       = 0.0
-                        ctrl.steer_angle_deg = 0.0
-                        cv2.putText(perc.lane_dbg,
-                            f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
-                            (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-                    elif elapsed_run < 6.0:
-                        ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
-                        cv2.putText(perc.lane_dbg,
-                            f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
-                            (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+                    if not calibration_done:
+                        if elapsed_run < 3.0:
+                            ctrl.speed_pwm       = 0.0
+                            ctrl.steer_angle_deg = 0.0
+                            cv2.putText(perc.lane_dbg,
+                                f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
+                                (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                        elif elapsed_run < 6.0:
+                            ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
+                            cv2.putText(perc.lane_dbg,
+                                f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
+                                (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
 
                     if safety.should_stop():
                         ctrl.speed_pwm = 0
@@ -1124,9 +1167,8 @@ class Orchestrator:
                         self.hw.set_speed(speed); self.hw.set_steering(ctrl.steer_angle_deg)
 
                 # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
-                push_latest(self._q_yolo,
-                            t_res.yolo_debug_frame if t_res.yolo_debug_frame is not None
-                            else raw_frame)
+                yolo_frame = t_res.yolo_debug_frame if (t_res is not None and getattr(t_res, 'yolo_debug_frame', None) is not None) else raw_frame
+                push_latest(self._q_yolo, yolo_frame)
                 push_latest(self._q_bev, _annotate_bev(perc, ctrl))
 
                 # VIZ-03: localization panel
