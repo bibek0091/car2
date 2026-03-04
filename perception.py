@@ -113,7 +113,7 @@ class DeadReckoningNavigator:
         """A-03: Uses bicycle model for lateral drift prediction."""
         t = max(0.0, self._lost_time_s)
         # Assuming last_steering is in radians and last_speed in m/s
-        yaw_rate_drift = last_speed / 0.23 * math.tan(last_steering) # 0.23m wheelbase approx
+        yaw_rate_drift = last_speed / 0.23 * math.tan(math.radians(last_steering)) # steering in degrees → radians
         lateral_drift = last_speed * math.sin(yaw_rate_drift * t) * 500  # px scaling approx
         
         predicted_target = self.last_valid_target + lateral_drift
@@ -335,7 +335,7 @@ class HybridLaneTracker:
             base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
             anchor = "RL_DUAL"
         elif sr is not None:
-            base_x = ev(sr) - self.SINGLE_LANE_PX / 2.0
+            base_x = ev(sr) - (lane_width_px / 2.0)
             anchor = "RL_FROM_EDGE"
         elif sl is not None:
             base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
@@ -539,7 +539,7 @@ class VisionPipeline:
         # Left-only heading is unreliable when sl has a noisy 2nd-order coefficient.
         heading_rad = 0.0
         def _lane_heading(fit, y):
-            return math.atan2(np.polyval(fit, y - 50) - np.polyval(fit, y), 50)
+            return math.atan2(-(np.polyval(fit, y - 50) - np.polyval(fit, y)), 50)
         if sl is not None and sr is not None:
             heading_rad = (_lane_heading(sl, y_eval) + _lane_heading(sr, y_eval)) / 2.0
         elif sl is not None:

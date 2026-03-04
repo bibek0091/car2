@@ -427,7 +427,8 @@ class LocalizationEngine:
         if not path or not self.planner:
             return
 
-        search_start = max(0,             self._path_cursor - 3)
+        # If we are near the end of the path, search the beginning too to detect a lap wrap
+        search_start = 0 if self._path_cursor > len(path) - 15 else max(0, self._path_cursor - 3)
         search_end   = min(len(path) - 1, self._path_cursor + 12)
 
         best_idx = self._path_cursor

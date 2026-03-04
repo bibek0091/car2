@@ -245,10 +245,11 @@ class PathPlanner:
             l3 = np.linalg.norm(p3 - p1)
             if l1 < 1e-4 or l2 < 1e-4 or l3 < 1e-4:
                 continue
-            # Signed area of triangle (cross product magnitude)
-            area = abs((p2[0]-p1[0])*(p3[1]-p1[1]) - (p3[0]-p1[0])*(p2[1]-p1[1])) / 2.0
+            # True Signed area of triangle (cross product)
+            # Positive area = left curve, Negative area = right curve
+            signed_area = ((p2[0]-p1[0])*(p3[1]-p1[1]) - (p3[0]-p1[0])*(p2[1]-p1[1])) / 2.0
             # Circumradius R = (l1*l2*l3) / (4*Area); curvature κ = 1/R
-            curvature_i = (4.0 * area) / max(l1 * l2 * l3, 1e-8)
+            curvature_i = (4.0 * signed_area) / max(l1 * l2 * l3, 1e-8)
             total_curvature += curvature_i
             count += 1
 

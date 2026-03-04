@@ -119,10 +119,11 @@ class DividerGuard:
                 speed_scale = min(speed_scale, max(0.5, 1.0 - err / 100.0))
                 triggered   = True
 
+        # div_corr requires steering right (negative), edge_corr requires steering left (positive)
         if div_corr > 0 and edge_corr > 0:
-            correction = max(div_corr - edge_corr, self.DEADBAND_PX * self.GAIN)
+            correction = max(edge_corr - div_corr, self.DEADBAND_PX * self.GAIN)
         else:
-            correction = div_corr - edge_corr
+            correction = edge_corr - div_corr
 
         return steer_angle + correction, speed_scale, triggered
 
