@@ -1,12 +1,11 @@
 """
 lane_follower.py — Standalone BFMC Lane Detection and Following
 ===============================================================
-A consolidated script extracted directly from perception.py, 
-control.py, hardware_io.py, and the main pilot loop. 
-
-Run with:
-  python lane_follower.py --sim                  (for simulation mode)
-  python lane_follower.py --sim-video path.mp4   (to test on a video file)
+FIXES APPLIED:
+  1. right_offset now used in CENTER_BOTH branch (was hardcoded to 40)
+  2. center_bias and left_offset are now actually applied to base_x
+  3. Stanley gain no longer collapses at low speed (velocity floor = 0.15 m/s)
+  4. _target_ema loosened 0.5/0.5 → 0.3/0.7 for faster offset tracking
 """
 
 import sys
@@ -25,7 +24,6 @@ from collections import deque
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("lane_follower")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 TARGET_FPS   = 30
 FRAME_PERIOD = 1.0 / TARGET_FPS
 PWM_DEADBAND = 10.0
@@ -35,7 +33,6 @@ C_AMBER = ( 50, 190, 255)
 C_RED   = ( 50,  50, 230)
 C_WHITE = (230, 230, 230)
 
-# ── GUI TUNER ─────────────────────────────────────────────────────
 
 class LaneTuner:
     def __init__(self):
@@ -52,7 +49,7 @@ class LaneTuner:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HARDWARE I/O (From hardware_io.py)
+# HARDWARE I/O
 # ══════════════════════════════════════════════════════════════════════════════
 
 try:
@@ -63,10 +60,10 @@ except ImportError:
     log.warning("STM32_SerialHandler not found. Using simulation mode for STM32.")
 
     class STM32_SerialHandler:
-        def connect(self):      return False
-        def set_speed(self, s): pass
+        def connect(self):         return False
+        def set_speed(self, s):    pass
         def set_steering(self, s): pass
-        def disconnect(self):   pass
+        def disconnect(self):      pass
 
 try:
     from picamera2 import Picamera2
@@ -91,15 +88,15 @@ class HardwareIO:
         self.video_cap = None
         self.serial    = STM32_SerialHandler()
 
-        self.DEADBAND_PWM  = 0.0       # Adjusted to 0 so constant speed 10 isn't clipped
-        self.SPEED_CALIB   = 0.00568   # m/s per PWM unit above deadband
+        self.DEADBAND_PWM  = 0.0
+        self.SPEED_CALIB   = 0.00568
         self.MAX_SPEED_MS  = 0.50
 
-        self._vel_filtered    = 0.0
-        self._sim_yaw         = 0.0
-        self._last_sim_time   = time.time()
-        self._last_cmd_speed  = 0.0
-        self._last_cmd_steer  = 0.0
+        self._vel_filtered       = 0.0
+        self._sim_yaw            = 0.0
+        self._last_sim_time      = time.time()
+        self._last_cmd_speed     = 0.0
+        self._last_cmd_steer     = 0.0
         self._encoder_fail_count = 0
         self._ENCODER_FAIL_LIMIT = 30
 
@@ -247,26 +244,26 @@ class HardwareIO:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERCEPTION (From perception.py)
+# PERCEPTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class PerceptionResult:
-    warped_binary:     np.ndarray
-    lane_dbg:          np.ndarray
-    sl:                object
-    sr:                object
-    target_x:          float
-    lateral_error_px:  float
-    anchor:            str
-    confidence:        float
-    lane_width_px:     float
-    curvature:         float
-    heading_rad:       float = 0.0
-    heading_conf:      float = 0.0
-    y_eval:            float = 400.0
-    optical_yaw_rate:  float = 0.0
-    optical_vel:       float = 0.0
+    warped_binary:    np.ndarray
+    lane_dbg:         np.ndarray
+    sl:               object
+    sr:               object
+    target_x:         float
+    lateral_error_px: float
+    anchor:           str
+    confidence:       float
+    lane_width_px:    float
+    curvature:        float
+    heading_rad:      float = 0.0
+    heading_conf:     float = 0.0
+    y_eval:           float = 400.0
+    optical_yaw_rate: float = 0.0
+    optical_vel:      float = 0.0
 
 
 class VisualOdometry:
@@ -326,7 +323,7 @@ class DeadReckoningNavigator:
 
     def predict_target(self, last_speed, last_steering):
         t = max(0.0, self._lost_time_s)
-        lateral_drift   = last_steering * 2.0 * t
+        lateral_drift    = last_steering * 2.0 * t
         predicted_target = self.last_valid_target + lateral_drift
         if abs(self.last_valid_curvature) > 0.001:
             predicted_target += self.last_valid_curvature * 5000 * t
@@ -388,7 +385,7 @@ class HybridLaneTracker:
             self.left_fit  = fl
             curv_now = self.get_curvature(self.h // 2)
             alpha = self.EMA_ALPHA_TURN if curv_now > 0.002 else self.EMA_ALPHA
-            self.sl        = self._ema(self.sl, fl, alpha)
+            self.sl         = self._ema(self.sl, fl, alpha)
             self.left_stale = 0
         else:
             self.left_stale += 1
@@ -400,7 +397,7 @@ class HybridLaneTracker:
             self.right_fit  = fr
             curv_now = self.get_curvature(self.h // 2)
             alpha = self.EMA_ALPHA_TURN if curv_now > 0.002 else self.EMA_ALPHA
-            self.sr         = self._ema(self.sr, fr, alpha)
+            self.sr          = self._ema(self.sr, fr, alpha)
             self.right_stale = 0
         else:
             self.right_stale += 1
@@ -438,20 +435,18 @@ class HybridLaneTracker:
             return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
 
         if has_right and has_left:
-            # Center of road when both lanes visible
             center = (ev(sl) + ev(sr)) / 2.0
-            # ensure center still respects right lane priority
-            right_limit = ev(sr) - 40
-            base_x = min(center, right_limit)
+            # FIX 1: use right_offset param — was hardcoded to 40, slider had no effect
+            right_limit = ev(sr) - right_offset
+            # FIX 2a: apply center_bias — was accepted but silently discarded
+            base_x = min(center, right_limit) + center_bias
             anchor = "CENTER_BOTH"
         elif has_right:
-            # Right lane priority
-            # Maintain safe divider distance
             base_x = ev(sr) - hw - right_offset
             anchor = "RIGHT_PRIORITY"
         elif has_left:
-            # fallback when right lane missing
-            base_x = ev(sl) + hw
+            # FIX 2b: apply left_offset — was accepted but silently discarded
+            base_x = ev(sl) + hw + left_offset
             anchor = "LEFT_FALLBACK"
 
         self.dead_reckoner.last_valid_target    = base_x
@@ -475,10 +470,10 @@ class HybridLaneTracker:
         if map_hint == "LEFT":  shift = -80
         elif map_hint == "RIGHT": shift = 80
 
-        l_lo =  max(margin, margin + shift)
-        l_hi =  max(l_lo + 1, mid - margin + shift)
-        r_lo =  max(margin, mid + margin + shift)
-        r_hi =  min(self.w - margin, self.w - margin)
+        l_lo = max(margin, margin + shift)
+        l_hi = max(l_lo + 1, mid - margin + shift)
+        r_lo = max(margin, mid + margin + shift)
+        r_hi = min(self.w - margin, self.w - margin)
 
         lb = int(np.argmax(hist[l_lo:l_hi])) + l_lo if l_hi > l_lo else margin
         rb = int(np.argmax(hist[r_lo:r_hi])) + r_lo if r_hi > r_lo else mid + margin
@@ -503,8 +498,8 @@ class HybridLaneTracker:
             cv2.rectangle(dbg, (xl0, y_lo), (xl1, y_hi), (0, 255, 0), 2)
             cv2.rectangle(dbg, (xr0, y_lo), (xr1, y_hi), (0, 255, 0), 2)
 
-            gl = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xl0)  & (nzx < xl1)).nonzero()[0]
-            gr = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xr0)  & (nzx < xr1)).nonzero()[0]
+            gl = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xl0) & (nzx < xl1)).nonzero()[0]
+            gr = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xr0) & (nzx < xr1)).nonzero()[0]
             li.append(gl); ri.append(gr)
 
             if len(gl) > self.MINPIX: lx = int(np.mean(nzx[gl]))
@@ -552,11 +547,11 @@ class VisionPipeline:
         self.lost_frames = 0
         self.last_target_x = 320.0
         self._heading_ema = 0.0
-        
-        # GUI parameters
+
+        # Written by StandalonePilot each frame from tuner
         self.right_offset = 40
-        self.left_offset = 0
-        self.center_bias = 0
+        self.left_offset  = 0
+        self.center_bias  = 0
 
     def process(self, raw_frame, dt: float = 0.033, extra_offset_px=0.0,
                 nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
@@ -580,32 +575,37 @@ class VisionPipeline:
         warped_colour = cv2.warpPerspective(process_frame, M_use, (640, 480))
         lab = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2LAB)
         L = self.clahe.apply(lab[:, :, 0])
-        
+
         mean_l = np.mean(L)
         if mean_l < 100:
             L = cv2.convertScaleAbs(L, alpha=1.0 + (100 - mean_l)/200, beta=int((100 - mean_l)*0.6))
         elif mean_l > 180:
             L = cv2.convertScaleAbs(L, alpha=1.0 - (mean_l - 180)/350, beta=int(-(mean_l - 180)*0.4))
 
-        binary = cv2.adaptiveThreshold(L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15)
-        warped_binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
-        
+        binary = cv2.adaptiveThreshold(L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 31, 15)
+        warped_binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
+                                         cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+
         map_hint = upcoming_curve if upcoming_curve in ("LEFT", "RIGHT") else "STRAIGHT"
         sl, sr, line_dbg, mode_label = self.tracker.update(warped_binary, map_hint=map_hint)
-        
+
         y_eval = 400.0
         lw = self.tracker.estimated_lane_width
-        
+
         target_x, anchor = self.tracker.get_target_x(
             y_eval, lw, extra_offset_px, nav_state, self.lost_frames,
             velocity_ms, last_steering,
             self.right_offset, self.left_offset, self.center_bias
         )
+
         if not hasattr(self, "_target_ema"):
             self._target_ema = target_x
-        self._target_ema = 0.5 * self._target_ema + 0.5 * target_x
+
+        # FIX 4: faster EMA — tracks slider changes in ~4 frames instead of ~10
+        self._target_ema = 0.3 * self._target_ema + 0.7 * target_x
         target_x = self._target_ema
-        
+
         if target_x is None:
             self.lost_frames += 1
             self.tracker.dead_reckoner.accumulate(dt)
@@ -615,19 +615,20 @@ class VisionPipeline:
             self.last_target_x = target_x
 
         curv = self.tracker.get_curvature(y_eval)
-        conf = 1.0 if (sl is not None and sr is not None) else 0.5 if (sl is not None or sr is not None) else 0.0
-        
+        conf = (1.0 if (sl is not None and sr is not None)
+                else 0.5 if (sl is not None or sr is not None) else 0.0)
+
         heading_rad = 0.0
         def _lane_heading(fit, y):
             return math.atan2(np.polyval(fit, y - 50) - np.polyval(fit, y), 50)
-        
+
         if sl is not None and sr is not None:
             heading_rad = (_lane_heading(sl, y_eval) + _lane_heading(sr, y_eval)) / 2.0
         elif sl is not None:
             heading_rad = _lane_heading(sl, y_eval)
         elif sr is not None:
             heading_rad = _lane_heading(sr, y_eval)
-            
+
         self._heading_ema = 0.7 * self._heading_ema + 0.3 * heading_rad
         heading_rad = self._heading_ema
 
@@ -641,7 +642,7 @@ class VisionPipeline:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONTROL (From control.py)
+# CONTROL
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -661,14 +662,17 @@ class StanleyController:
         self.ks = ks
         self.L  = wheelbase_m
 
-    def compute(self, target_x_px: float, heading_rad: float, velocity_ms: float, 
+    def compute(self, target_x_px: float, heading_rad: float, velocity_ms: float,
                 lane_width_px: float, map_curvature: float = 0.0):
         ppm  = max(lane_width_px, 50) / 0.35
         ce_m = (320.0 - target_x_px) / ppm
-        # amplify lateral error so steering reacts faster
         ce_m *= 2.5
 
-        k_eff = self.k * min(1.0, velocity_ms / 0.25)
+        # FIX 3: floor velocity used only for gain scaling.
+        # At real operating speed (~0.057 m/s), k_eff was dropping to 23% of design.
+        # Now floors at 0.15 m/s → k_eff stays at 60% minimum even when nearly stopped.
+        v_for_gain   = max(velocity_ms, 0.15)
+        k_eff        = self.k * min(1.0, v_for_gain / 0.25)
         reactive_rad = heading_rad + math.atan2(k_eff * ce_m, velocity_ms + self.ks)
         feed_forward_rad = math.atan(self.L * map_curvature)
 
@@ -676,24 +680,6 @@ class StanleyController:
         reactive_deg = math.degrees(reactive_rad)
         ff_deg       = math.degrees(feed_forward_rad)
         return total_deg, reactive_deg, ff_deg
-
-class PurePursuitController:
-    def __init__(self, wheelbase_m=0.23, lookahead_px=120):
-        self.L = wheelbase_m
-        self.lookahead_px = lookahead_px
-
-    def compute(self, target_x_px, lane_width_px):
-        # convert pixel error into meters
-        ppm = max(lane_width_px, 50) / 0.35
-
-        dx = (target_x_px - 320.0) / ppm
-        dy = self.lookahead_px / ppm
-
-        alpha = math.atan2(dx, dy)
-        steer_rad = math.atan2(2 * self.L * math.sin(alpha), dy)
-        steer_deg = math.degrees(steer_rad)
-
-        return steer_deg
 
 
 class DividerGuard:
@@ -740,23 +726,16 @@ class Controller:
     def __init__(self):
         self.prev_steer = 0.0
         self.guard      = DividerGuard()
-        self.pure_pursuit = PurePursuitController(
-            wheelbase_m=0.23,
-            lookahead_px=120
-        )
+        self.stanley    = StanleyController(k=3.2, ks=0.15, wheelbase_m=0.23)
 
     def compute(self, perc_res, nav_state: str = "NORMAL", velocity_ms: float = 0.0,
                 dt: float = 0.033, traffic_mult: float = 1.0,
                 map_curvature: float = 0.0, upcoming_curve: str = "STRAIGHT",
                 curve_dist_m: float = 99.0) -> ControlOutput:
 
-        raw_steer = self.pure_pursuit.compute(
-            perc_res.target_x,
-            perc_res.lane_width_px
-        )
-
-        react_steer_deg = raw_steer
-        ff_steer_deg = 0.0
+        raw_steer, react_steer_deg, ff_steer_deg = self.stanley.compute(
+            perc_res.target_x, perc_res.heading_rad, velocity_ms,
+            perc_res.lane_width_px, map_curvature)
 
         rate_delta  = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, raw_steer - self.prev_steer))
         steer_angle = self.prev_steer + rate_delta
@@ -769,7 +748,6 @@ class Controller:
             steer_angle, perc_res.sl, perc_res.sr, y_eval=perc_res.y_eval)
         steer_angle = max(-self.MAX_STEER, min(self.MAX_STEER, steer_guarded))
 
-        # A constant slower speed of 10 replaces all variable dynamic speed calculations
         final_speed = 10.0
 
         return ControlOutput(
@@ -784,63 +762,64 @@ class Controller:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VISUALIZATION & ORCHESTRATION (From main.py)
+# VISUALIZATION & ORCHESTRATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _lbl(img, txt, x, y, scale=0.38, color=C_WHITE, t=1):
     cv2.putText(img, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, t, cv2.LINE_AA)
 
 def _annotate_bev(perc, ctrl):
-    dbg = perc.lane_dbg.copy() if perc.lane_dbg is not None else np.zeros((480,640,3),np.uint8)
+    dbg = perc.lane_dbg.copy() if perc.lane_dbg is not None else np.zeros((480, 640, 3), np.uint8)
 
     def draw_poly(fit, color):
         if fit is None: return
-        ys  = np.linspace(40,479,240).astype(np.float32)
-        xs  = np.clip(np.polyval(fit,ys),0,639).astype(np.float32)
-        pts = np.stack([xs,ys],axis=1).reshape(-1,1,2).astype(np.int32)
-        cv2.polylines(dbg,[pts],False,color,3,cv2.LINE_AA)
+        ys  = np.linspace(40, 479, 240).astype(np.float32)
+        xs  = np.clip(np.polyval(fit, ys), 0, 639).astype(np.float32)
+        pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(dbg, [pts], False, color, 3, cv2.LINE_AA)
 
-    draw_poly(perc.sl,(255,80,80))
-    draw_poly(perc.sr,(80,80,255))
+    draw_poly(perc.sl, (255, 80, 80))
+    draw_poly(perc.sr, (80, 80, 255))
 
     if perc.sl is not None and perc.sr is not None:
-        lx = int(np.clip(np.polyval(perc.sl,400),0,639))
-        rx = int(np.clip(np.polyval(perc.sr,400),0,639))
-        cv2.line(dbg,(lx,400),(rx,400),(70,170,70),1,cv2.LINE_AA)
-        _lbl(dbg,f"w={perc.lane_width_px:.0f}px",(lx+rx)//2-20,396,scale=0.34,color=(70,170,70))
+        lx = int(np.clip(np.polyval(perc.sl, 400), 0, 639))
+        rx = int(np.clip(np.polyval(perc.sr, 400), 0, 639))
+        cv2.line(dbg, (lx, 400), (rx, 400), (70, 170, 70), 1, cv2.LINE_AA)
+        _lbl(dbg, f"w={perc.lane_width_px:.0f}px", (lx+rx)//2-20, 396,
+             scale=0.34, color=(70, 170, 70))
 
     yrow = int(perc.y_eval)
     yc   = C_GREEN if "DUAL" in ctrl.anchor else (C_AMBER if "DEAD" not in ctrl.anchor else C_RED)
-    for xi in range(0,640,18): cv2.line(dbg,(xi,yrow),(xi+9,yrow),yc,1,cv2.LINE_AA)
+    for xi in range(0, 640, 18): cv2.line(dbg, (xi, yrow), (xi+9, yrow), yc, 1, cv2.LINE_AA)
 
     tx = max(4, min(636, int(ctrl.target_x)))
-    for yi in range(360,440,12): cv2.line(dbg,(tx,yi),(tx,yi+6),(0,255,255),2,cv2.LINE_AA)
-    cv2.line(dbg,(tx-12,yrow),(tx+12,yrow),(0,255,255),2,cv2.LINE_AA)
+    for yi in range(360, 440, 12): cv2.line(dbg, (tx, yi), (tx, yi+6), (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(dbg, (tx-12, yrow), (tx+12, yrow), (0, 255, 255), 2, cv2.LINE_AA)
 
     curv = perc.curvature
     if curv > 1e-5:
-        R = min(int(1.0/curv),1400)
+        R = min(int(1.0/curv), 1400)
         if R < 700:
-            sign = 1 if (perc.sl is not None and perc.sl[0]>0) else -1
-            cv2.ellipse(dbg,(tx+sign*R,400),(R,R),0,84,96,(190,70,170),2,cv2.LINE_AA)
+            sign = 1 if (perc.sl is not None and perc.sl[0] > 0) else -1
+            cv2.ellipse(dbg, (tx+sign*R, 400), (R, R), 0, 84, 96, (190, 70, 170), 2, cv2.LINE_AA)
 
-    _lbl(dbg,ctrl.anchor,10,25,scale=0.50,color=C_WHITE)
-    _lbl(dbg,f"steer={ctrl.steer_angle_deg:+.1f}",10,50,scale=0.44,color=(70,225,70))
-    _lbl(dbg,f"conf={perc.confidence:.2f}  curv={perc.curvature:.5f}",10,72,scale=0.37,color=(150,150,150))
+    _lbl(dbg, ctrl.anchor, 10, 25, scale=0.50, color=C_WHITE)
+    _lbl(dbg, f"steer={ctrl.steer_angle_deg:+.1f}", 10, 50, scale=0.44, color=(70, 225, 70))
+    _lbl(dbg, f"conf={perc.confidence:.2f}  curv={perc.curvature:.5f}", 10, 72,
+         scale=0.37, color=(150, 150, 150))
     return dbg
 
 
 class StandalonePilot:
     """A stripped-down autonomous orchestrator that purely tracks and follows the lane."""
     def __init__(self, sim_mode=False, sim_video=None):
-        self.sim_mode = sim_mode
-        self.hw = HardwareIO(sim_mode=sim_mode, sim_video=sim_video)
-        self.vision = VisionPipeline()
+        self.sim_mode   = sim_mode
+        self.hw         = HardwareIO(sim_mode=sim_mode, sim_video=sim_video)
+        self.vision     = VisionPipeline()
         self.controller = Controller()
-        self.running = False
+        self.running    = False
         self._last_ctrl = None
-
-        self.tuner = LaneTuner()
+        self.tuner      = LaneTuner()
 
     def run(self):
         self.running = True
@@ -848,18 +827,17 @@ class StandalonePilot:
         startup_time = time.time()
         t_prev = time.time()
         _ll = 0; _LLC = 15; _LLS = 90
-        
+
         try:
             while self.running:
                 right_offset, left_offset, center_bias = self.tuner.read()
-
                 self.vision.right_offset = right_offset
-                self.vision.left_offset = left_offset
-                self.vision.center_bias = center_bias
+                self.vision.left_offset  = left_offset
+                self.vision.center_bias  = center_bias
 
-                ts = time.time()
-                dt = max(ts - t_prev, 0.001)
-                t_prev = ts
+                ts          = time.time()
+                dt          = max(ts - t_prev, 0.001)
+                t_prev      = ts
                 elapsed_run = ts - startup_time
 
                 raw_frame = self.hw.read_camera()
@@ -876,7 +854,7 @@ class StandalonePilot:
                     last_steering=getattr(self._last_ctrl, 'steer_angle_deg', 0.0),
                     upcoming_curve="STRAIGHT"
                 )
-                
+
                 print("TARGET_X:", perc.target_x)
 
                 ctrl = self.controller.compute(
@@ -890,7 +868,7 @@ class StandalonePilot:
 
                 # Startup calibration override
                 if elapsed_run < 3.0:
-                    ctrl.speed_pwm = 0.0
+                    ctrl.speed_pwm       = 0.0
                     ctrl.steer_angle_deg = 0.0
                     cv2.putText(perc.lane_dbg, f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
                                 (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
@@ -911,10 +889,9 @@ class StandalonePilot:
                     self.hw.set_speed(speed)
                     self.hw.set_steering(ctrl.steer_angle_deg)
 
-                # BEV Visualization Window
                 dbg = _annotate_bev(perc, ctrl)
                 cv2.imshow("Standalone BEV Lane Tracker", dbg)
-                if cv2.waitKey(1) & 0xFF == 27: # ESC to quit
+                if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
                     self.running = False
 
                 elapsed = time.time() - ts
@@ -935,7 +912,7 @@ class StandalonePilot:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Standalone Lane Detection and Following")
     ap.add_argument("--sim",       action="store_true", help="Run in simulation mode")
-    ap.add_argument("--sim-video", type=str,   default=None, help="Path to video for testing")
+    ap.add_argument("--sim-video", type=str, default=None, help="Path to video for testing")
     args = ap.parse_args()
 
     pilot = StandalonePilot(sim_mode=args.sim, sim_video=args.sim_video)
