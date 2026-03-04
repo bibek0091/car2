@@ -422,10 +422,13 @@ class HybridLaneTracker:
 
         if has_right:
             if has_left:
-                base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
+                # Exactly in the middle when both lines are visible
+                base_x = (ev(sl) + ev(sr)) / 2.0
                 anchor = "RL_DUAL"
             else:
-                base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
+                # Keep an extra offset to the left from the right edge to avoid touching it
+                # 'hw' is half lane width. Subtracting an extra 20px pushes the target leftward.
+                base_x = ev(sr) - hw - 20
                 anchor = "RL_FROM_EDGE"
         else:
             base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
@@ -797,7 +800,7 @@ def _annotate_bev(perc, ctrl):
 
 class StandalonePilot:
     """A stripped-down autonomous orchestrator that purely tracks and follows the lane."""
-    def __init__(self, sim_mode=False, base_speed=50.0, sim_video=None):
+    def __init__(self, sim_mode=False, base_speed=40.0, sim_video=None):
         self.sim_mode = sim_mode
         self.base_speed = base_speed
         self.hw = HardwareIO(sim_mode=sim_mode, sim_video=sim_video)
@@ -893,7 +896,7 @@ class StandalonePilot:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Standalone Lane Detection and Following")
     ap.add_argument("--sim",       action="store_true", help="Run in simulation mode")
-    ap.add_argument("--speed",     type=float, default=50, help="Base speed PWM")
+    ap.add_argument("--speed",     type=float, default=40.0, help="Base speed PWM")
     ap.add_argument("--sim-video", type=str,   default=None, help="Path to video for testing")
     args = ap.parse_args()
 
