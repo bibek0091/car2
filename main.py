@@ -104,7 +104,7 @@ TARGET_FPS   = 30
 FRAME_PERIOD = 1.0 / TARGET_FPS
 PWM_DEADBAND = 14.0
 _SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-SVG_PATH_DEFAULT = os.path.join(_SCRIPT_DIR, "..", "Track.svg")
+SVG_PATH_DEFAULT = os.path.join(_SCRIPT_DIR, "Track.svg")
 MAP_W_M = 22.0
 MAP_H_M = 15.0
 
