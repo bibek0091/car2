@@ -115,6 +115,13 @@ class LocalizationEngine:
         self.current_zone     = "CITY"
         self._last_speed_ms   = 0.0
 
+        # Sensor health (updated each call to update())
+        self._imu_fresh       = False   # True if IMU was updated this frame
+        self._cam_fresh       = False   # True if camera confidence > 0.3
+        self._snap_fresh      = False   # True if map snap fired this frame
+        self._health_log      = []      # last 30 frames of (imu,cam,snap) bools
+        self._HEALTH_LOG_LEN  = 30
+
         # FIX VL-FIX-A: cursor is fully self-managed
         self._path_cursor = 0
         self._snap_miss_frames = 0   # for recovery snap
@@ -200,7 +207,27 @@ class LocalizationEngine:
                 "cursor":          self._path_cursor,
                 "speed_ms":        self._last_speed_ms,
                 "initialized":     self._initialized,
+                "health":          self.get_health_summary(),
             }
+
+    def _update_health(self, imu_fresh, cam_fresh, snap_fresh):
+        self._imu_fresh   = imu_fresh
+        self._cam_fresh   = cam_fresh
+        self._snap_fresh  = snap_fresh
+        self._health_log.append((imu_fresh, cam_fresh, snap_fresh))
+        if len(self._health_log) > self._HEALTH_LOG_LEN:
+            self._health_log.pop(0)
+
+    def get_health_summary(self) -> dict:
+        """Returns per-sensor availability over last 30 frames (0.0–1.0)."""
+        if not self._health_log:
+            return {"imu": 0.0, "cam": 0.0, "snap": 0.0, "overall": 0.0}
+        n = len(self._health_log)
+        imu_  = sum(h[0] for h in self._health_log) / n
+        cam_  = sum(h[1] for h in self._health_log) / n
+        snap_ = sum(h[2] for h in self._health_log) / n
+        overall = (imu_ + cam_ + snap_) / 3.0
+        return {"imu": imu_, "cam": cam_, "snap": snap_, "overall": overall}
 
     def check_poi_arrival(self, target_node_id: str,
                           threshold_m: float = None) -> bool:
@@ -319,18 +346,16 @@ class LocalizationEngine:
         if dt <= 0:
             return
 
-        # F-03: Auto-init on first valid perception frame.
-        # If set_pose() was never called (operator forgot), snap to nearest map node
-        # so we don't dead-reckon from (0,0) which is off the BFMC track.
+        # F-03 FIX: if set_pose() was never called, do NOT snap to nearest(0,0).
+        # (0,0) is off the BFMC track — dead-reckoning from there ruins the whole run.
+        # Warn once per frame and skip until the operator sets a valid start position.
         if not self._initialized:
-            if camera_confidence > 0.5 and self.planner:
-                # F-03 FIX: auto-snap to nearest(0,0) is always wrong on BFMC track.
-                # Require the operator to call set_pose() via map click or --start-node.
-                log.warning(
-                    "F-03: Localizer not initialized. "
-                    "Call set_pose(x, y, yaw_rad) before starting the run. "
-                    "Skipping auto-snap to avoid placing car at world-origin node.")
-            return   # do not dead-reckon from (0,0)
+            log.warning(
+                "LocalizationEngine.update() called before set_pose(). "
+                "Dead-reckoning from (0,0) is off the BFMC track. "
+                "Pass --start-node <node_id> on the command line, or "
+                "click the start position on the SVG map before enabling drive.")
+            return   # DO NOT snap to (0,0) — skip frame entirely
 
         with self._lock:
             # OPT: use optical_vel as velocity fallback when encoder is dead
@@ -343,45 +368,50 @@ class LocalizationEngine:
                 self._update_cursor_internal(path)
             cursor = self._path_cursor
 
-            # ── Layer 1: Camera Yaw-Rate Integration (LOC-A + LOC-B) ──────────
-            # LOC-A: only integrate when heading agreement is strong
+            # ── Layer 1: Camera Yaw-Rate Integration (LOC-A + LOC-B) ──────────────
+            # LOC-A: gate on heading_conf > 0.35 to reject noisy single-line frames
             if heading_conf > 0.35 and camera_confidence > 0.3:
-                raw_yaw_rate = 0.0
                 if self._prev_cam_heading is not None:
                     raw_yaw_rate = (camera_heading_rad - self._prev_cam_heading) / max(dt, 0.001)
+                else:
+                    raw_yaw_rate = 0.0
                 self._prev_cam_heading = camera_heading_rad
 
                 # LOC-B: dual-rate EMA — fast on turns, slow on straights
                 alpha = 0.30 if abs(raw_yaw_rate) > 0.3 else 0.12
-                self._cam_yaw_smoothed = alpha * raw_yaw_rate + (1.0 - alpha) * self._cam_yaw_smoothed
+                self._cam_yaw_smoothed = (alpha * raw_yaw_rate
+                                          + (1.0 - alpha) * self._cam_yaw_smoothed)
                 self.visual_yaw_rate = self._cam_yaw_smoothed
 
-                yaw_delta = np.clip(self._cam_yaw_smoothed * dt,
-                                    -self._MAX_CAM_YAW_CORRECTION,
-                                     self._MAX_CAM_YAW_CORRECTION)
+                yaw_delta = float(np.clip(
+                    self._cam_yaw_smoothed * dt,
+                    -self._MAX_CAM_YAW_CORRECTION,
+                     self._MAX_CAM_YAW_CORRECTION))
                 self.yaw += yaw_delta
                 self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
-                # LOC-C: absolute heading soft-fusion (long-run drift corrector)
-                abs_err = (camera_heading_rad - self.yaw + math.pi) % (2 * math.pi) - math.pi
-                abs_corr = np.clip(abs_err * self._ABS_HEADING_GAIN,
-                                   -self._ABS_HEADING_MAX_CORR, self._ABS_HEADING_MAX_CORR)
+                # LOC-C: absolute lane-tangent soft correction (drift preventer)
+                # camera_heading_rad is RELATIVE (see PROMPT 2) — apply as delta
+                abs_corr = float(np.clip(camera_heading_rad * self._ABS_HEADING_GAIN,
+                                         -self._ABS_HEADING_MAX_CORR,
+                                          self._ABS_HEADING_MAX_CORR))
                 self.yaw += abs_corr
                 self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
             else:
                 self._prev_cam_heading = None   # reset on low-confidence frames
+                self.visual_yaw_rate   = 0.0
 
-            # OPT: optical_yaw_rate fallback (when camera has no lane lines)
+            # OPT: optical_yaw_rate fallback when camera has no lane lines
             if optical_yaw_rate != 0.0 and camera_confidence < 0.2:
-                opt_delta = np.clip(optical_yaw_rate * dt, -0.04, 0.04)
+                opt_delta = float(np.clip(optical_yaw_rate * dt, -0.04, 0.04))
                 self.yaw += opt_delta
                 self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
-            # ── Layer 2: A* Path Heading Nudge ────────────────────────────────
-            # Prevents long-run yaw drift by gently aligning with map segment.
+            # ── Layer 2: A* Path Heading Nudge (drift corrector) ──────────────────
+            # Only active when camera is uncertain — prevents over-riding good vision.
             if (self._map_snap_enabled and self.planner and path
                     and cursor < len(path) - 1
-                    and camera_confidence < 0.4):   # only when camera is uncertain
+                    and camera_confidence < 0.4):
                 n1 = path[cursor]
                 n2 = path[min(cursor + 1, len(path) - 1)]
                 p1 = self.planner.node_positions.get(n1)
@@ -389,9 +419,8 @@ class LocalizationEngine:
                 if p1 and p2:
                     seg_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
                     nudge_err = (seg_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
-                    # Only nudge when car heading is close enough to path (< 30°)
                     if abs(math.degrees(nudge_err)) < 30:
-                        self.yaw += np.clip(nudge_err * 0.02, -0.01, 0.01)
+                        self.yaw += float(np.clip(nudge_err * 0.02, -0.01, 0.01))
                         self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 3: Forward Dead-Reckoning ──────────────────────────────
@@ -420,6 +449,12 @@ class LocalizationEngine:
                 self._apply_map_snap_gated(v, dt, camera_confidence,
                                            path, cursor)
                 self.current_zone = self.planner.get_zone(self.x, self.y)
+
+            self._update_health(
+                imu_fresh  = (imu_heading_rad is not None),
+                cam_fresh  = (camera_confidence > 0.3),
+                snap_fresh = (self._snap_miss_frames == 0),
+            )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

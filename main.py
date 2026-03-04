@@ -266,6 +266,31 @@ class MapOverlayRenderer:
         hx = cx + int(math.cos(yaw)*22); hy = cy - int(math.sin(yaw)*22)
         cv2.arrowedLine(img,(cx,cy),(hx,hy),C_WHITE,2,tipLength=0.4,line_type=cv2.LINE_AA)
 
+        # Movement vector: average direction of last 5 trail points
+        # This is the ACTUAL travel direction, independent of estimated yaw.
+        trail_pts = list(self._trail)
+        if len(trail_pts) >= 6:
+            recent = trail_pts[-6:]
+            dx_t = recent[-1][0] - recent[0][0]
+            dy_t = recent[-1][1] - recent[0][1]
+            dist  = math.hypot(dx_t, dy_t)
+            if dist > 0.02:   # only draw if car actually moved >= 2 cm
+                mv_yaw = math.atan2(dy_t, dx_t)
+                mvx = cx + int(math.cos(mv_yaw) * 18)
+                mvy = cy - int(math.sin(mv_yaw) * 18)   # flip y for pixel space
+                cv2.arrowedLine(img, (cx, cy), (mvx, mvy),
+                                (0, 255, 180), 2, tipLength=0.5,
+                                line_type=cv2.LINE_AA)
+                # Yaw drift indicator: if movement direction differs > 15° from yaw arrow,
+                # draw a red arc between them to make drift visible
+                drift_deg = abs(math.degrees(
+                    (mv_yaw - yaw + math.pi) % (2 * math.pi) - math.pi))
+                if drift_deg > 15.0:
+                    arc_col = (50, 50, 200) if drift_deg < 30 else (50, 50, 255)
+                    cv2.ellipse(img, (cx, cy), (20, 20),
+                                int(math.degrees(min(yaw, mv_yaw))),
+                                0, int(drift_deg), arc_col, 2, cv2.LINE_AA)
+
         # Zone badge
         zc = {"CITY":(40,110,40),"HIGHWAY":(160,70,20),"PARKING":(30,90,150)}.get(zone,(80,80,80))
         _badge(img, zone, self.iw-86, 22, zc, w=82)
@@ -404,7 +429,7 @@ class LocalizationPanel:
 
     def render(self, x, y, yaw_deg, yaw_rate, heading_conf, snap_miss,
                confidence, upcoming_curve, curve_dist_m, lat_err_px,
-               velocity_ms, zone, nav_state, l1, l2, l4):
+               velocity_ms, velocity_src, zone, nav_state, l1, l2, l4, health):
         img = np.full((self.H, self.W, 3), 18, np.uint8)
 
         # Title
@@ -417,8 +442,10 @@ class LocalizationPanel:
         cv2.putText(img,f"X: {x:+8.3f} m",(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.68,pc,2,cv2.LINE_AA)
         cv2.putText(img,f"Y: {y:+8.3f} m",(10,90),cv2.FONT_HERSHEY_SIMPLEX,0.68,pc,2,cv2.LINE_AA)
         cv2.putText(img,f"YAW: {yaw_deg:+7.1f}\u00b0",(10,120),cv2.FONT_HERSHEY_SIMPLEX,0.68,pc,2,cv2.LINE_AA)
-        _lbl(img, f"v={velocity_ms:.3f}m/s   zone={zone}   nav={nav_state}",
-             10, 140, scale=0.37, color=(150,150,150))
+        src_c = (50,220,50) if velocity_src == "ENCODER" else (50,180,255)
+        _lbl(img,
+             f"v={velocity_ms:.3f}m/s [{velocity_src}]   zone={zone}   nav={nav_state}",
+             10, 140, scale=0.37, color=src_c)
 
         # Yaw-rate sparkline
         _lbl(img,"YAW-RATE (rad/s)",8,162,scale=0.35,color=(130,130,180))
@@ -466,6 +493,25 @@ class LocalizationPanel:
         _lbl(img,f"CONF: {confidence:.2f}",self.W//2,362,scale=0.37,color=pc)
         _hbar(img,confidence,1.0,self.W//2,365,self.W//2-10,10,pc)
 
+        # Sensor health summary bar
+        _lbl(img, "SENSOR HEALTH:", 8, 385, scale=0.35, color=(130,130,155))
+        for i, (label, key) in enumerate([("IMU",  "imu"),
+                                           ("CAM",  "cam"),
+                                           ("SNAP", "snap")]):
+            val = health.get(key, 0.0)
+            hc  = (50,200,50) if val>0.7 else ((50,180,200) if val>0.3 else (50,50,200))
+            bx_ = 8 + i * 120
+            _lbl(img, f"{label}: {val:.0%}", bx_, 400, scale=0.34, color=hc)
+            _hbar(img, val, 1.0, bx_, 402, 108, 7, hc)
+
+        # DEAD-RECKONING WARNING if all sensors lost
+        overall = health.get("overall", 1.0)
+        if overall < 0.25:
+            cv2.rectangle(img, (0, img.shape[0]-30), (img.shape[1], img.shape[0]),
+                          (0, 0, 160), -1)
+            _lbl(img, "⚠ ALL SENSORS LOST — DEAD RECKONING",
+                 8, img.shape[0]-10, scale=0.42, color=(200,200,50))
+
         return img
 
 
@@ -493,7 +539,7 @@ def _steer_gauge(img, steer, cx, cy, r):
 def _draw_telemetry_panel(steer, speed_pwm, lat_err, conf, anchor,
                           zone, upcoming_curve, fps, sign_history,
                           nav_state, l_conf, r_conf, curvature,
-                          velocity_ms, w=560, h=480):
+                          velocity_ms, velocity_src="?", w=560, h=480):
     img = np.full((h,w,3),18,np.uint8)
     cv2.rectangle(img,(0,0),(w,28),(28,28,40),-1)
     _lbl(img,"TELEMETRY",8,18,scale=0.48,color=(160,160,220),t=1)
@@ -528,10 +574,15 @@ def _draw_telemetry_panel(steer, speed_pwm, lat_err, conf, anchor,
 
     # Explicit m/s speed readout in large text so it is always readable at a glance
     cv2.line(img, (195, 260), (w-10, 260), (40, 40, 40), 1)
-    spd_col = C_GREEN if velocity_ms > 0.05 else C_AMBER
+    src_col = (50, 220, 50) if velocity_src == "ENCODER" else (50, 180, 255)
+    src_txt = "ENC" if velocity_src == "ENCODER" else "EST"
     cv2.putText(img, f"{velocity_ms:.3f} m/s", (200, 310),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.80, spd_col, 2, cv2.LINE_AA)
-    _lbl(img, "VEHICLE SPEED", 200, 295, scale=0.34, color=(100, 100, 100))
+                cv2.FONT_HERSHEY_SIMPLEX, 0.80, src_col, 2, cv2.LINE_AA)
+    _lbl(img, f"VEHICLE SPEED  [{src_txt}]", 200, 295,
+         scale=0.34, color=src_col)
+    # If estimating, show a small warning badge
+    if velocity_src != "ENCODER":
+        _badge(img, "NO ENCODER", 200, 330, (30, 30, 160), w=90)
 
     nc = C_GREEN if nav_state=="NORMAL" else (C_AMBER if "JUNCTION" in nav_state else C_CYAN)
     _lbl(img,f"NAV: {nav_state}",200,227,scale=0.37,color=nc)
@@ -624,6 +675,7 @@ def _status_bar(w, estop, fps, zone, nav_state, upcoming_curve, curve_dist_m,
     _badge(img,f" {upcoming_curve}@{cd} ",392,22,ucc,w=120)
     sc = (30,110,30) if snap_miss<5 else ((25,90,160) if snap_miss<20 else (0,0,160))
     _badge(img,f" SNAP:{snap_miss} ",522,22,sc,w=80)
+    _lbl(img, "→YAW  →MOV  ◔DRIFT", w-200, 22, scale=0.30, color=(150,150,150))
     return img
 
 
@@ -922,6 +974,7 @@ class Orchestrator:
             ctrl  = self._last_ctrl
             perc  = self._last_perc
             vm    = self.hw.get_velocity() if self.running else loc_data.get("speed_ms",0.0)
+            vm_src= self.hw.get_velocity_source() if self.running else "PWM_EST"
             ti = _draw_telemetry_panel(
                 steer         = ctrl.steer_angle_deg,
                 speed_pwm     = ctrl.speed_pwm,
@@ -937,6 +990,7 @@ class Orchestrator:
                 r_conf        = (1.0 if (perc and perc.sr is not None) else 0.0),
                 curvature     = perc.curvature if perc else 0.0,
                 velocity_ms   = vm,
+                velocity_src  = vm_src,
                 w=self.TEL_W, h=self.TEL_H)
             self._telem_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(ti,cv2.COLOR_BGR2RGB)))
             self._telem_label.config(image=self._telem_ph)
@@ -1284,6 +1338,7 @@ class Orchestrator:
                 lx,ly,lyaw = self.localizer.get_pose()
                 yr     = self.localizer.visual_yaw_rate
                 self._loc_panel.push(yr, perc.lateral_error_px, lx, ly, sm==0)
+                vm_src_loc = self.hw.get_velocity_source()
                 loc_img = self._loc_panel.render(
                     x=lx, y=ly, yaw_deg=math.degrees(lyaw),
                     yaw_rate=yr, heading_conf=perc.heading_conf,
@@ -1291,10 +1346,12 @@ class Orchestrator:
                     upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
                     curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0),
                     lat_err_px=perc.lateral_error_px, velocity_ms=velocity_ms,
+                    velocity_src=vm_src_loc,
                     zone=self.localizer.current_zone, nav_state=self._nav_state,
                     l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
                     l2=bool(self._planned_path and perc.confidence>0.5),
-                    l4=sm<5)
+                    l4=sm<5,
+                    health=loc_data.get("health", {}))
                 push_latest(self._q_loc, loc_img)
 
                 # Root Cause C: render map in pilot thread to keep GUI at full 30Hz
@@ -1357,11 +1414,18 @@ class Orchestrator:
 
 def main():
     ap = argparse.ArgumentParser(description="BFMC v4 — Visual Localization Pilot")
-    ap.add_argument("--sim",       action="store_true")
-    ap.add_argument("--speed",     type=float, default=50)
-    ap.add_argument("--svg",       type=str,   default=None)
-    ap.add_argument("--sim-video", type=str,   default=None)
-    ap.add_argument("--race-mode", action="store_true")
+    ap.add_argument("--sim",        action="store_true")
+    ap.add_argument("--speed",      type=float, default=50)
+    ap.add_argument("--svg",        type=str,   default=None)
+    ap.add_argument("--sim-video",  type=str,   default=None)
+    ap.add_argument("--race-mode",  action="store_true")
+    ap.add_argument("--start-node", type=str,   default=None,
+                    help="GraphML node ID for the car's start position. "
+                         "E.g. --start-node n42. Run with --list-nodes to see all.")
+    ap.add_argument("--start-yaw",  type=float, default=0.0,
+                    help="Initial heading in degrees (0=East, 90=North).")
+    ap.add_argument("--list-nodes", action="store_true",
+                    help="Print all map node IDs and exit.")
     args = ap.parse_args()
 
     orch = Orchestrator(sim_mode=args.sim, base_speed=args.speed,
@@ -1371,6 +1435,28 @@ def main():
     if args.sim_video:
         orch.hw.sim_video = args.sim_video
         orch.hw.video_cap = cv2.VideoCapture(args.sim_video)
+
+    # ── Start-node / list-nodes handling ───────────────────────────────────
+    if args.list_nodes:
+        if orch.localizer.planner:
+            for nid, (nx_, ny_) in sorted(orch.localizer.planner.node_positions.items()):
+                print(f"  {nid:>10s}  x={nx_:.2f}  y={ny_:.2f}")
+        sys.exit(0)
+
+    if args.start_node:
+        pp = orch.localizer.planner
+        if pp and args.start_node in pp.node_positions:
+            sx, sy = pp.node_positions[args.start_node]
+            orch.localizer.set_pose(sx, sy, math.radians(args.start_yaw))
+            log.info(f"Start pose set: node={args.start_node} "
+                     f"({sx:.2f},{sy:.2f}) yaw={args.start_yaw:.1f}°")
+        else:
+            log.error(f"--start-node '{args.start_node}' not found in map. "
+                      f"Run with --list-nodes to see valid IDs.")
+            sys.exit(1)
+    else:
+        log.warning("No --start-node provided. Localizer will not initialize "
+                    "until operator clicks start position on the map.")
 
     if not args.race_mode:
         root = tk.Tk()

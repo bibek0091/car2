@@ -226,6 +226,16 @@ class HardwareIO:
 
         return result
 
+    def get_velocity_source(self) -> str:
+        """Returns the data source for the current velocity reading."""
+        ENCODER_STALE_S = 0.5
+        if (not self.sim_mode and
+                hasattr(self.serial, "status") and
+                hasattr(self.serial.status, "_speed_timestamp") and
+                (time.time() - self.serial.status._speed_timestamp) < ENCODER_STALE_S):
+            return "ENCODER"
+        return "PWM_EST"
+
     def get_encoder_steer_deg(self):
         if self.sim_mode:
             return self._last_cmd_steer

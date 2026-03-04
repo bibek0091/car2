@@ -87,11 +87,9 @@ class DividerGuard:
     """
 
     # ── Sync with perception.py Tier-1 targets ──────────────────────────────
-    # DIVIDER_SAFE_PX should roughly equal DIVIDER_FOLLOW_OFFSET_PX (130 px) so
-    # the guard activates just before the Tier-2 divider-follow target.
-    # EDGE_SAFE_PX should be < (SINGLE_LANE_PX/2 - RIGHT_LANE_BIAS_PX) = 100 - (-15) = 115
-    # so the guard does NOT fire when the car is correctly centred in its lane.
-    # When adjusting perception.py constants, update these to match.
+    # DIVIDER_SAFE_PX (130) must be < DIVIDER_FOLLOW_OFFSET_PX (155) by ≥ 20px.
+    # EDGE_SAFE_PX (80) must be < (SINGLE_LANE_PX/2 + RIGHT_LANE_BIAS_PX) = 110px.
+    # If you change perception.py constants, update these margins accordingly.
     # ────────────────────────────────────────────────────────────────────────
     DIVIDER_SAFE_PX = 130   # raised from 110: stronger push away from centre divider
     EDGE_SAFE_PX    =  80   # reduced from 100: Tier-1 target already keeps car clear of right edge

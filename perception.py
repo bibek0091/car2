@@ -131,8 +131,10 @@ class HybridLaneTracker:
     # DIVIDER_FOLLOW_OFFSET_PX: when sr is lost, track this many px right of sl.
     WIDE_ROAD_PX             = 420   # full-road threshold (both lanes visible in BEV)
     SINGLE_LANE_PX           = 200   # minimum plausible single-lane width
-    RIGHT_LANE_BIAS_PX       = -15   # target shifted LEFT of lane centre — buffer from right edge
-    DIVIDER_FOLLOW_OFFSET_PX = 130   # right-lane centre ~= half of SINGLE_LANE_PX
+    RIGHT_LANE_BIAS_PX       =  10   # shift RIGHT: 10px right of lane centre gives ~150px
+                                     # gap to divider (> 130px DividerGuard threshold)
+    DIVIDER_FOLLOW_OFFSET_PX = 155   # 25px above DIVIDER_SAFE_PX=130 → guard never fires
+                                     # during Tier-2 mode despite EMA jitter
 
     def __init__(self, img_shape=(480, 640)):
         self.h, self.w = img_shape
