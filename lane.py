@@ -677,6 +677,24 @@ class StanleyController:
         ff_deg       = math.degrees(feed_forward_rad)
         return total_deg, reactive_deg, ff_deg
 
+class PurePursuitController:
+    def __init__(self, wheelbase_m=0.23, lookahead_px=120):
+        self.L = wheelbase_m
+        self.lookahead_px = lookahead_px
+
+    def compute(self, target_x_px, lane_width_px):
+        # convert pixel error into meters
+        ppm = max(lane_width_px, 50) / 0.35
+
+        dx = (target_x_px - 320.0) / ppm
+        dy = self.lookahead_px / ppm
+
+        alpha = math.atan2(dx, dy)
+        steer_rad = math.atan2(2 * self.L * math.sin(alpha), dy)
+        steer_deg = math.degrees(steer_rad)
+
+        return steer_deg
+
 
 class DividerGuard:
     DIVIDER_SAFE_PX = 110
@@ -722,15 +740,23 @@ class Controller:
     def __init__(self):
         self.prev_steer = 0.0
         self.guard      = DividerGuard()
-        self.stanley    = StanleyController(k=3.2, ks=0.15, wheelbase_m=0.23)
+        self.pure_pursuit = PurePursuitController(
+            wheelbase_m=0.23,
+            lookahead_px=120
+        )
 
     def compute(self, perc_res, nav_state: str = "NORMAL", velocity_ms: float = 0.0,
                 dt: float = 0.033, traffic_mult: float = 1.0,
                 map_curvature: float = 0.0, upcoming_curve: str = "STRAIGHT",
                 curve_dist_m: float = 99.0) -> ControlOutput:
 
-        raw_steer, react_steer_deg, ff_steer_deg = self.stanley.compute(
-            perc_res.target_x, perc_res.heading_rad, velocity_ms, perc_res.lane_width_px, map_curvature)
+        raw_steer = self.pure_pursuit.compute(
+            perc_res.target_x,
+            perc_res.lane_width_px
+        )
+
+        react_steer_deg = raw_steer
+        ff_steer_deg = 0.0
 
         rate_delta  = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, raw_steer - self.prev_steer))
         steer_angle = self.prev_steer + rate_delta
