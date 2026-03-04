@@ -211,15 +211,7 @@ class Controller:
         if self._straight_frames >= self._STRAIGHT_BOOST_DELAY:
             speed = min(speed * 1.04, base_speed * 1.08)   # gentler boost, less instability near next curve
 
-        # 4c. Dead-reckoning speed penalty
-        if "DEAD_RECKONING" in perc_res.anchor:
-            try:
-                dr_conf = float(perc_res.anchor.split("_")[2])
-            except Exception:
-                dr_conf = 0.5
-            speed *= (0.4 + 0.4 * dr_conf)
-
-        # 4d. Divider-follow speed penalty
+        # 4c. Divider-follow speed penalty
         # Right outer edge is lost — car is shadowing the centre divider.
         # 25% speed reduction; recovers next frame sr reappears (anchor → RL_*).
         if perc_res.anchor == "DIVIDER_FOLLOW":
