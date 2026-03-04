@@ -216,7 +216,15 @@ class HardwareIO:
             return 0.0
 
         est_speed = (abs(pwm) - self.DEADBAND_PWM) * self.SPEED_CALIB
-        return min(est_speed, self.MAX_SPEED_MS)
+        result = min(est_speed, self.MAX_SPEED_MS)
+
+        # Sim mode: apply a velocity EMA so position updates smoothly
+        # instead of jumping from 0 → est_speed in one frame
+        if self.sim_mode:
+            self._vel_filtered = 0.3 * result + 0.7 * self._vel_filtered
+            return self._vel_filtered
+
+        return result
 
     def get_encoder_steer_deg(self):
         if self.sim_mode:

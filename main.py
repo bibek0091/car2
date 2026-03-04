@@ -472,7 +472,7 @@ def _steer_gauge(img, steer, cx, cy, r):
 def _draw_telemetry_panel(steer, speed_pwm, lat_err, conf, anchor,
                           zone, upcoming_curve, fps, sign_history,
                           nav_state, l_conf, r_conf, curvature,
-                          velocity_ms, w=480, h=360):
+                          velocity_ms, w=560, h=480):
     img = np.full((h,w,3),18,np.uint8)
     cv2.rectangle(img,(0,0),(w,28),(28,28,40),-1)
     _lbl(img,"TELEMETRY",8,18,scale=0.48,color=(160,160,220),t=1)
@@ -536,36 +536,38 @@ def _annotate_bev(perc, ctrl):
         return np.zeros((480, 640, 3), np.uint8)
     dbg = perc.lane_dbg.copy() if perc.lane_dbg is not None \
           else np.zeros((480, 640, 3), np.uint8)
+    h, w = dbg.shape[:2]   # use actual dimensions, not hardcoded
     if perc.warped_binary is not None and not perc.warped_binary.any():
         cv2.putText(dbg, "BEV: ZERO WHITE PIXELS — CHECK SRC_PTS CALIBRATION",
-                    (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1)
+                    (10, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1)
 
     def draw_poly(fit, color):
         if fit is None: return
-        ys  = np.linspace(40,479,240).astype(np.float32)
-        xs  = np.clip(np.polyval(fit,ys),0,639).astype(np.float32)
-        pts = np.stack([xs,ys],axis=1).reshape(-1,1,2).astype(np.int32)
-        cv2.polylines(dbg,[pts],False,color,3,cv2.LINE_AA)
+        ys  = np.linspace(40, h-1, 240).astype(np.float32)
+        xs  = np.clip(np.polyval(fit, ys), 0, w-1).astype(np.float32)
+        pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(dbg, [pts], False, color, 3, cv2.LINE_AA)
 
     draw_poly(perc.sl,(255,80,80))
     draw_poly(perc.sr,(80,80,255))
 
     # Lane width annotation
     if perc.sl is not None and perc.sr is not None:
-        lx = int(np.clip(np.polyval(perc.sl,400),0,639))
-        rx = int(np.clip(np.polyval(perc.sr,400),0,639))
-        cv2.line(dbg,(lx,400),(rx,400),(70,170,70),1,cv2.LINE_AA)
-        _lbl(dbg,f"w={perc.lane_width_px:.0f}px",(lx+rx)//2-20,396,scale=0.34,color=(70,170,70))
+        lx = int(np.clip(np.polyval(perc.sl, h*5//6), 0, w-1))
+        rx = int(np.clip(np.polyval(perc.sr, h*5//6), 0, w-1))
+        row = h*5//6
+        cv2.line(dbg, (lx, row), (rx, row), (70,170,70), 1, cv2.LINE_AA)
+        _lbl(dbg, f"w={perc.lane_width_px:.0f}px", (lx+rx)//2-20, row-4, scale=0.34, color=(70,170,70))
 
     # y_eval dashed row
     yrow = int(perc.y_eval)
     yc   = C_GREEN if "DUAL" in ctrl.anchor else (C_AMBER if "DEAD" not in ctrl.anchor else C_RED)
-    for xi in range(0,640,18): cv2.line(dbg,(xi,yrow),(xi+9,yrow),yc,1,cv2.LINE_AA)
+    for xi in range(0, w, 18): cv2.line(dbg, (xi, yrow), (xi+9, yrow), yc, 1, cv2.LINE_AA)
 
     # Target dashed crosshair
-    tx = max(4, min(636, int(ctrl.target_x)))
-    for yi in range(360,440,12): cv2.line(dbg,(tx,yi),(tx,yi+6),(0,255,255),2,cv2.LINE_AA)
-    cv2.line(dbg,(tx-12,yrow),(tx+12,yrow),(0,255,255),2,cv2.LINE_AA)
+    tx = max(4, min(w-4, int(ctrl.target_x)))
+    for yi in range(h*3//4, h*11//12, 12): cv2.line(dbg, (tx,yi), (tx,yi+6), (0,255,255), 2, cv2.LINE_AA)
+    cv2.line(dbg, (tx-12, yrow), (tx+12, yrow), (0,255,255), 2, cv2.LINE_AA)
 
     # Curvature arc
     curv = perc.curvature
@@ -657,9 +659,9 @@ class JunctionDetector:
 class Orchestrator:
     BASE_SPEED = 50
     MAP_W=600; MAP_H=440
-    CAM_W=480; CAM_H=360
-    LOC_W=520; LOC_H=400
-    TEL_W=480; TEL_H=360
+    CAM_W=640; CAM_H=480
+    LOC_W=640; LOC_H=480
+    TEL_W=560; TEL_H=480
 
     def __init__(self, sim_mode=False, base_speed=None, svg_path=None):
         self.sim_mode   = sim_mode
@@ -715,6 +717,13 @@ class Orchestrator:
         self._q_yolo  = queue.Queue(maxsize=1)
         self._q_bev   = queue.Queue(maxsize=1)
         self._q_loc   = queue.Queue(maxsize=1)
+        self._speed_ema        = 0.0    # exponential moving average of speed command
+        self._SPEED_EMA_ALPHA  = 0.25   # 0.25 = slow smooth; raise to 0.5 for faster response
+        self._traffic_mult_ema = 1.0    # EMA of YOLO traffic multiplier — sticky decisions
+        self._TRAFFIC_EMA_ALPHA = 0.15  # very slow — traffic decisions should be sticky
+        self._curve_dist_ema   = 99.0   # EMA of curve distance — smooths waypoint jumps
+        self._CURVE_EMA_ALPHA  = 0.20   # 20% new, 80% history per frame
+        self._q_map  = queue.Queue(maxsize=1)
 
     def build_ui(self, root):
         self._root = root
@@ -728,7 +737,7 @@ class Orchestrator:
         self._refresh_status_label(np.full((32,1290,3),28,np.uint8))
 
         # Row 1: Map | YOLO | GraphML
-        r1 = tk.Frame(root, bg="#0d0d0d"); r1.pack(padx=6, pady=4)
+        r1 = tk.Frame(root, bg="#0d0d0d"); r1.pack(padx=4, pady=2)
         for col, title, fg, attr, blank in [
             (0," MAP — click: Start→Dest ","#00e5ff","_map_label",
              cv2.cvtColor(self._svg_base,cv2.COLOR_BGR2RGB)),
@@ -747,7 +756,7 @@ class Orchestrator:
         self._map_label.bind("<Button-1>", self._on_map_click)
 
         # Row 2: BEV | Localization | Telemetry
-        r2 = tk.Frame(root, bg="#0d0d0d"); r2.pack(padx=6, pady=(0,4))
+        r2 = tk.Frame(root, bg="#0d0d0d"); r2.pack(padx=4, pady=(0,2))
         for col, title, fg, attr, blank in [
             (0," LANE VIEW (BEV) ","#69ff47","_bev_label",
              np.zeros((self.CAM_H,self.CAM_W,3),np.uint8)),
@@ -830,17 +839,18 @@ class Orchestrator:
             snap_miss = getattr(self.localizer,'_snap_miss_frames',0)
             hconf_raw = getattr(self.localizer,'_cam_yaw_smoothed',0.0)
 
-            if self.localizer.is_initialized():
+            # Root Cause B: always add trail if we have a plausible position (not at 0,0 default)
+            if x != 0.0 or y != 0.0:
                 self._map_renderer.add_trail_point(x, y)
 
-            map_img = self._map_renderer.render(
-                x,y,yaw,self._planned_path,self._path_cursor,
-                self.localizer.planner,conf,zone,
-                snap_miss=snap_miss,
-                heading_conf=abs(hconf_raw)*2.0)  # scale to 0-1 approx
-            self._map_ph = ImageTk.PhotoImage(
-                Image.fromarray(cv2.cvtColor(map_img,cv2.COLOR_BGR2RGB)))
-            self._map_label.config(image=self._map_ph)
+            # Root Cause C: read map frame from pilot-thread queue (non-blocking)
+            try:
+                map_img = self._q_map.get_nowait()
+                self._map_ph = ImageTk.PhotoImage(
+                    Image.fromarray(cv2.cvtColor(map_img, cv2.COLOR_BGR2RGB)))
+                self._map_label.config(image=self._map_ph)
+            except queue.Empty:
+                pass   # keep the last displayed map image
 
             if self.localizer.is_initialized():
                 self._sv_pose.set(
@@ -990,6 +1000,13 @@ class Orchestrator:
                 # --- EXTRACT PREDICTIVE MAP DATA (available even during E-STOP) ---
                 upcoming_curve = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
                 curve_dist_m   = getattr(self.localizer, 'curve_dist_m',   99.0)
+                # Smooth curve distance to prevent braking oscillation from discrete waypoint jumps
+                if curve_dist_m < 99.0:
+                    self._curve_dist_ema = (self._CURVE_EMA_ALPHA * curve_dist_m
+                                            + (1.0 - self._CURVE_EMA_ALPHA) * self._curve_dist_ema)
+                else:
+                    self._curve_dist_ema = min(self._curve_dist_ema + 0.05, 99.0)  # slowly recover
+                curve_dist_m = self._curve_dist_ema   # use smoothed value for controller
                 map_curvature  = 0.0
                 if self._planned_path and self.localizer.planner:
                     try:
@@ -1019,6 +1036,10 @@ class Orchestrator:
                 
                 if self._threaded_yolo and not self._threaded_yolo.is_alive():
                     t_res.speed_multiplier = 0.3
+
+                # Smooth the traffic multiplier — YOLO detections are noisy frame-to-frame
+                self._traffic_mult_ema = (self._TRAFFIC_EMA_ALPHA * t_res.speed_multiplier
+                                          + (1.0 - self._TRAFFIC_EMA_ALPHA) * self._traffic_mult_ema)
 
                 self._last_t_res = t_res
 
@@ -1129,7 +1150,7 @@ class Orchestrator:
                     ctrl = self.controller.compute(
                         perc_res=perc, nav_state=self._nav_state,
                         base_speed=float(self.base_speed),
-                        traffic_mult=t_res.speed_multiplier,
+                        traffic_mult=self._traffic_mult_ema,   # smoothed, not raw
                         velocity_ms=velocity_ms, dt=dt,
                         map_curvature=map_curvature,
                         upcoming_curve=upcoming_curve,
@@ -1162,9 +1183,19 @@ class Orchestrator:
                         self._estop=True
                     else:
                         speed = ctrl.speed_pwm
-                        if _ll>=_LLC: speed = min(speed,20.0)
-                        if 0.0<speed<PWM_DEADBAND: speed=PWM_DEADBAND
-                        self.hw.set_speed(speed); self.hw.set_steering(ctrl.steer_angle_deg)
+                        if _ll >= _LLC: speed = min(speed, 20.0)
+                        if 0.0 < speed < PWM_DEADBAND: speed = PWM_DEADBAND
+
+                        # Low-pass filter: smooth speed commands so jitter doesn't reach the motor
+                        if speed == 0.0:
+                            self._speed_ema = 0.0      # hard zero on E-STOP / stop commands
+                        else:
+                            self._speed_ema = (self._SPEED_EMA_ALPHA * speed
+                                               + (1.0 - self._SPEED_EMA_ALPHA) * self._speed_ema)
+                            if self._speed_ema < PWM_DEADBAND:
+                                self._speed_ema = PWM_DEADBAND
+
+                        self.hw.set_speed(self._speed_ema); self.hw.set_steering(ctrl.steer_angle_deg)
 
                 # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
                 yolo_frame = t_res.yolo_debug_frame if (t_res is not None and getattr(t_res, 'yolo_debug_frame', None) is not None) else raw_frame
@@ -1188,6 +1219,20 @@ class Orchestrator:
                     l2=bool(self._planned_path and perc.confidence>0.5),
                     l4=sm<5)
                 push_latest(self._q_loc, loc_img)
+
+                # Root Cause C: render map in pilot thread to keep GUI at full 30Hz
+                if self.localizer.is_initialized():
+                    snap_miss_m = getattr(self.localizer, '_snap_miss_frames', 0)
+                    hconf_raw_m = getattr(self.localizer, '_cam_yaw_smoothed', 0.0)
+                    conf_m = self._last_conf
+                    zone_m = self.localizer.current_zone
+                    map_img = self._map_renderer.render(
+                        lx, ly, lyaw,
+                        self._planned_path, self._path_cursor,
+                        self.localizer.planner, conf_m, zone_m,
+                        snap_miss=snap_miss_m,
+                        heading_conf=abs(hconf_raw_m) * 2.0)
+                    push_latest(self._q_map, map_img)
 
                 elapsed = time.time()-ts
                 time.sleep(max(0.001, FRAME_PERIOD-elapsed))

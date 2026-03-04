@@ -132,13 +132,17 @@ class Controller:
     MED_CURV_THRESH  = 0.0010
 
     # Smooth curve braking parameters
-    BRAKING_DISTANCE_M = 1.8   # metres before apex to start braking
-    MIN_CURVE_SPEED_F  = 0.45  # fraction of base_speed at apex (45%)
+    BRAKING_DISTANCE_M = 1.2    # start braking later — less oscillation time
+    MIN_CURVE_SPEED_F  = 0.62   # 62% of base — smoother, less dramatic slowdown
 
     def __init__(self):
-        self.prev_steer = 0.0
-        self.guard      = DividerGuard()
-        self.stanley    = StanleyController(k=1.2, ks=0.2, wheelbase_m=0.23)
+        self.prev_steer     = 0.0
+        self.guard          = DividerGuard()
+        self._guard_spd_ema = 1.0   # EMA of guard speed multiplier
+        self._GUARD_EMA     = 0.3   # 0.3 = moderate smooth; lower for stickier
+        self.stanley        = StanleyController(k=1.2, ks=0.2, wheelbase_m=0.23)
+        self._straight_frames      = 0
+        self._STRAIGHT_BOOST_DELAY = 8   # frames (~0.27s) of straight before boost applies
 
     def compute(self, perc_res,
                 nav_state:      str   = "NORMAL",
@@ -172,6 +176,10 @@ class Controller:
         # ── 3. Divider Guard ────────────────────────────────────────────────
         steer_guarded, guard_spd_mult, _ = self.guard.apply(
             steer_angle, perc_res.sl, perc_res.sr, y_eval=perc_res.y_eval)
+        # Smooth the guard speed multiplier to avoid instantaneous speed drops
+        self._guard_spd_ema = (self._GUARD_EMA * guard_spd_mult
+                               + (1.0 - self._GUARD_EMA) * self._guard_spd_ema)
+        guard_spd_mult = self._guard_spd_ema
         steer_angle = max(-self.MAX_STEER, min(self.MAX_STEER, steer_guarded))
 
         # ── 4. Speed Profiling ──────────────────────────────────────────────
@@ -189,7 +197,12 @@ class Controller:
             braked_speed = min_curve_speed + (base_speed - min_curve_speed) * decel_factor
             speed = min(speed, braked_speed)
         elif abs(steer_angle) < 5:
-            speed = min(speed * 1.15, base_speed * 1.20)   # straight-line boost, capped
+            self._straight_frames = min(self._straight_frames + 1, self._STRAIGHT_BOOST_DELAY + 5)
+        else:
+            self._straight_frames = 0
+
+        if self._straight_frames >= self._STRAIGHT_BOOST_DELAY:
+            speed = min(speed * 1.08, base_speed * 1.15)   # gentler boost, delayed
 
         # 4c. Dead-reckoning speed penalty
         if "DEAD_RECKONING" in perc_res.anchor:
