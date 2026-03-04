@@ -695,7 +695,7 @@ class Controller:
     def __init__(self):
         self.prev_steer = 0.0
         self.guard      = DividerGuard()
-        self.stanley    = StanleyController(k=1.2, ks=0.2, wheelbase_m=0.23)
+        self.stanley    = StanleyController(k=1.8, ks=0.2, wheelbase_m=0.23)
 
     def compute(self, perc_res, nav_state: str = "NORMAL", velocity_ms: float = 0.0,
                 dt: float = 0.033, base_speed: float = 50.0, traffic_mult: float = 1.0,
@@ -708,7 +708,7 @@ class Controller:
         rate_delta  = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, raw_steer - self.prev_steer))
         steer_angle = self.prev_steer + rate_delta
 
-        alpha = 0.7
+        alpha = 0.25
         steer_angle = alpha * self.prev_steer + (1 - alpha) * steer_angle
         self.prev_steer = steer_angle
 
