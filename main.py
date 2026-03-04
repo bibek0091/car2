@@ -278,81 +278,102 @@ class MapOverlayRenderer:
             cv2.rectangle(img,(0,self.ih-8),(bw,self.ih),(0,170,80),-1)
             _lbl(img, f"{cursor}/{len(path)}  {prog*100:.0f}%",
                  4, self.ih-11, scale=0.32)
-        return img
+        # ── MERGED GRAPH OVERLAY ──────────────────────────────────────────────
+        # GraphML drawn on top of SVG so roads show through.
+        if getattr(self, '_graph_renderer', None) is not None:
+            img = self._graph_renderer.render_on(
+                img, path or [], cursor, None,
+                velocity_ms=0.3, alpha=0.80)
+        # ──────────────────────────────────────────────────────────────────────
 
+        return img
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VIZ-05 — GraphMLRenderer
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GraphMLRenderer:
-    def __init__(self, planner, canvas_w=480, canvas_h=360):
-        self.planner = planner
+    def __init__(self, planner, canvas_w=600, canvas_h=440,
+                 map_w_m=MAP_W_M, map_h_m=MAP_H_M):
+        self.planner   = planner
         self.W, self.H = canvas_w, canvas_h
+        self.map_w_m   = map_w_m
+        self.map_h_m   = map_h_m
         self._jct_nodes = set()
         if not planner or not planner.node_positions:
-            self._base = np.full((canvas_h, canvas_w, 3), 18, np.uint8)
             return
-        positions = list(planner.node_positions.values())
-        xs = [p[0] for p in positions]; ys = [p[1] for p in positions]
-        self.x_min, self.x_max = min(xs), max(xs)
-        self.y_min, self.y_max = min(ys), max(ys)
         for nid in planner.graph.nodes():
-            if planner.is_at_junction(nid): self._jct_nodes.add(nid)
-        self._base = self._draw_static()
+            if planner.is_at_junction(nid):
+                self._jct_nodes.add(nid)
 
     def _p(self, x, y):
-        m = 22
-        return (int((x-self.x_min)/max(self.x_max-self.x_min,0.01)*(self.W-2*m))+m,
-                int((self.y_max-y)/max(self.y_max-self.y_min,0.01)*(self.H-2*m))+m)
+        """Use SAME coordinate system as MapOverlayRenderer — global map_to_pixel()."""
+        return map_to_pixel(x, y, self.W, self.H, self.map_w_m, self.map_h_m)
 
-    def _draw_static(self):
-        img = np.full((self.H, self.W, 3), 18, np.uint8)
+    def render_on(self, base_img, path, cursor, nearest_node,
+                  velocity_ms=0.3, alpha=0.75):
+        """
+        Draw the GraphML overlay ONTO base_img (the SVG map image).
+        Uses semi-transparent lines so the SVG road markings show through.
+        Returns the composited image.
+        """
+        if not self.planner:
+            return base_img
+
+        overlay = base_img.copy()
+
+        # Draw all graph edges (dim, so SVG roads stay visible)
         for u, v, d in self.planner.graph.edges(data=True):
             p1 = self.planner.node_positions.get(u)
             p2 = self.planner.node_positions.get(v)
-            if p1 and p2:
-                cv2.line(img, self._p(*p1), self._p(*p2),
-                         (38,38,50) if not d.get('dotted') else (28,28,42), 1, cv2.LINE_AA)
-        for nid, (x,y) in self.planner.node_positions.items():
-            col = ((160,160,30) if nid in self.planner._roundabout_nodes else
-                   (30,180,180) if nid in self._jct_nodes else (55,55,70))
-            cv2.circle(img, self._p(x,y), 2, col, -1)
-        return img
+            if not p1 or not p2:
+                continue
+            col = (50, 30, 80) if not d.get('dotted') else (35, 20, 55)
+            cv2.line(overlay, self._p(*p1), self._p(*p2), col, 1, cv2.LINE_AA)
 
-    def render(self, path, cursor, nearest_node, velocity_ms=0.3):
-        img = self._base.copy()
-        if not self.planner: return img
-        for i in range(len(path)-1):
+        # Draw all graph nodes (small, colour-coded)
+        for nid, (x, y) in self.planner.node_positions.items():
+            col = ((0, 180, 180) if nid in self.planner._roundabout_nodes else
+                   (160, 140, 0) if nid in self._jct_nodes else (60, 60, 80))
+            cv2.circle(overlay, self._p(x, y), 2, col, -1)
+
+        # Draw planned path on top
+        for i in range(len(path) - 1):
             p1 = self.planner.node_positions.get(path[i])
-            p2 = self.planner.node_positions.get(path[i+1])
-            if not p1 or not p2: continue
+            p2 = self.planner.node_positions.get(path[i + 1])
+            if not p1 or not p2:
+                continue
             if i < cursor:
-                col, thick = (30,110,30), 1
+                col, thick = (30, 140, 30), 1
             elif i == cursor:
-                col, thick = (0,210,255), 3
+                col, thick = (0, 230, 255), 3
             else:
-                frac = min((i-cursor)/max(len(path)-cursor,1), 1.0)
-                col  = (30, int(190*(1-frac)), int(200*frac)); thick = 1
-            cv2.line(img, self._p(*p1), self._p(*p2), col, thick, cv2.LINE_AA)
+                frac = min((i - cursor) / max(len(path) - cursor, 1), 1.0)
+                col  = (30, int(200 * (1 - frac)), int(210 * frac))
+                thick = 2
+            cv2.line(overlay, self._p(*p1), self._p(*p2), col, thick, cv2.LINE_AA)
 
-        # Lookahead circle
-        la_m = max(2.5, velocity_ms*6.0)
+        # Lookahead marker
         if 0 <= cursor < len(path):
             pos = self.planner.node_positions.get(path[cursor])
             if pos:
-                ppm = (self.W-44) / max(self.x_max-self.x_min, 0.01)
-                cv2.circle(img, self._p(*pos), int(la_m*ppm), (45,45,75), 1, cv2.LINE_AA)
-                cv2.circle(img, self._p(*pos), 7, (200,50,200), -1, cv2.LINE_AA)
+                la_px = int(max(2.5, velocity_ms * 6.0) / self.map_w_m * self.W)
+                cv2.circle(overlay, self._p(*pos), la_px, (45, 45, 90), 1, cv2.LINE_AA)
+                cv2.circle(overlay, self._p(*pos), 7, (210, 60, 210), -1, cv2.LINE_AA)
 
+        # Nearest node highlight
         if nearest_node and nearest_node in self.planner.node_positions:
-            cv2.circle(img, self._p(*self.planner.node_positions[nearest_node]),
-                       5, C_WHITE, 1, cv2.LINE_AA)
+            cv2.circle(overlay,
+                       self._p(*self.planner.node_positions[nearest_node]),
+                       6, C_WHITE, 1, cv2.LINE_AA)
 
-        _lbl(img, f"A* GRAPH  cursor={cursor}", 4, 14, scale=0.36, color=(110,110,140))
-        _lbl(img, "[teal=rbt  cyan=jct  orange=active]",
-             4, self.H-6, scale=0.28, color=(70,70,90))
-        return img
+        # Blend overlay onto base so SVG shows through
+        result = cv2.addWeighted(overlay, alpha, base_img, 1.0 - alpha, 0)
+
+        # Legend (drawn AFTER blend so it's fully opaque)
+        _lbl(result, "[cyan=rbt  yellow=jct  cyan_line=active]",
+             4, self.H - 6, scale=0.28, color=(90, 90, 110))
+        return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -711,7 +732,12 @@ class Orchestrator:
 
         self._svg_base     = _load_svg_as_cv2(self.svg_path, self.MAP_W, self.MAP_H)
         self._map_renderer = MapOverlayRenderer(self._svg_base, MAP_W_M, MAP_H_M)
-        self._graph_renderer = None
+        self._graph_renderer = (
+            GraphMLRenderer(self.localizer.planner, self.MAP_W, self.MAP_H)
+            if self.localizer.planner else None
+        )
+        # Step D: inject graph renderer so map render() can call render_on()
+        self._map_renderer._graph_renderer = self._graph_renderer
         self._loc_panel    = LocalizationPanel(self.LOC_W, self.LOC_H)
 
         self._q_yolo  = queue.Queue(maxsize=1)
@@ -736,15 +762,15 @@ class Orchestrator:
         self._sl = tk.Label(self._sf, bg="#1a1a1a"); self._sl.pack(fill=tk.X)
         self._refresh_status_label(np.full((32,1290,3),28,np.uint8))
 
-        # Row 1: Map | YOLO | GraphML
+        # Row 1: MAP+GRAPH | YOLO+CALIB | BEV
         r1 = tk.Frame(root, bg="#0d0d0d"); r1.pack(padx=4, pady=2)
         for col, title, fg, attr, blank in [
-            (0," MAP — click: Start→Dest ","#00e5ff","_map_label",
-             cv2.cvtColor(self._svg_base,cv2.COLOR_BGR2RGB)),
-            (1," CAMERA + YOLO ","#ff9100","_yolo_label",
-             np.zeros((self.CAM_H,self.CAM_W,3),np.uint8)),
-            (2," GRAPH (A* route) ","#69ff47","_graph_label",
-             np.full((self.CAM_H,self.CAM_W,3),18,np.uint8)),
+            (0, " MAP + GRAPH OVERLAY ", "#00e5ff", "_map_label",
+             cv2.cvtColor(self._svg_base, cv2.COLOR_BGR2RGB)),
+            (1, " CAMERA + YOLO ", "#ff9100", "_yolo_label",
+             np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)),
+            (2, " BEV LANE VIEW ", "#69ff47", "_bev_label",
+             np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)),
         ]:
             fr = tk.LabelFrame(r1,text=title,bg="#0d0d0d",fg=fg,font=("Courier",9,"bold"))
             fr.grid(row=0,column=col,padx=4)
@@ -755,15 +781,13 @@ class Orchestrator:
             setattr(self,attr.replace("label","ph"),ph)
         self._map_label.bind("<Button-1>", self._on_map_click)
 
-        # Row 2: BEV | Localization | Telemetry
+        # Row 2: Localization | Telemetry (BEV moved to Row 1)
         r2 = tk.Frame(root, bg="#0d0d0d"); r2.pack(padx=4, pady=(0,2))
         for col, title, fg, attr, blank in [
-            (0," LANE VIEW (BEV) ","#69ff47","_bev_label",
-             np.zeros((self.CAM_H,self.CAM_W,3),np.uint8)),
-            (1," LOCALIZATION ENGINE ","#ff4fd8","_loc_label",
-             np.full((self.LOC_H,self.LOC_W,3),18,np.uint8)),
-            (2," TELEMETRY ","#ff9100","_telem_label",
-             np.full((self.TEL_H,self.TEL_W,3),18,np.uint8)),
+            (0, " LOCALIZATION ENGINE ", "#ff4fd8", "_loc_label",
+             np.full((self.LOC_H, self.LOC_W, 3), 18, np.uint8)),
+            (1, " TELEMETRY ", "#ff9100", "_telem_label",
+             np.full((self.TEL_H, self.TEL_W, 3), 18, np.uint8)),
         ]:
             fr = tk.LabelFrame(r2,text=title,bg="#0d0d0d",fg=fg,font=("Courier",9,"bold"))
             fr.grid(row=0,column=col,padx=4)
@@ -786,10 +810,6 @@ class Orchestrator:
                             ("START","#8e44ad",self._start_pilot)]:
             tk.Button(bf,text=txt,bg=bg,fg="white",font=("Courier",9,"bold"),
                       command=cmd).pack(side=tk.LEFT,padx=4)
-
-        if self.localizer.planner:
-            self._graph_renderer = GraphMLRenderer(
-                self.localizer.planner, self.CAM_W, self.CAM_H)
 
         self._gui_update()
 
@@ -894,13 +914,6 @@ class Orchestrator:
                 self._loc_label.config(image=self._loc_ph)
             except queue.Empty: pass
 
-            if self._graph_renderer:
-                vm = self.hw.get_velocity() if self.running else 0.0
-                gi = self._graph_renderer.render(
-                    self._planned_path,self._path_cursor,nearest,velocity_ms=vm)
-                self._graph_ph = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(gi,cv2.COLOR_BGR2RGB)))
-                self._graph_label.config(image=self._graph_ph)
-
             ctrl  = self._last_ctrl
             perc  = self._last_perc
             vm    = self.hw.get_velocity() if self.running else loc_data.get("speed_ms",0.0)
@@ -940,8 +953,14 @@ class Orchestrator:
         t_prev = time.time()
         _ll = 0; _LLC = 15; _LLS = 90; _zmf = 0
         
-        imu = BNO055_IMU()
-        imu.start()
+        try:
+            imu = BNO055_IMU()   # safe — degrades to sim if hardware absent
+            imu.start()
+        except Exception as e:
+            log.error(f"IMU init failed: {e} — using null IMU")
+            imu = BNO055_IMU.__new__(BNO055_IMU)
+            imu._yaw_offset = 0.0; imu._sim_mode = True; imu._sim_yaw = 0.0
+            imu.bus = None
 
         from visual_calibrator import VisualCalibrator
         from safety import SafetySupervisor
@@ -962,12 +981,14 @@ class Orchestrator:
                     safety.update_camera()
                 velocity_ms = self.hw.get_velocity()
                 safety.update_serial()   # always update — serial health checked separately
+                safety.update_yolo()     # always alive — traffic check handled separately
 
                 if not calibration_done:
                     calib.add_frame(raw_frame)
                     self._sv_hint.set(calib._result.status_msg)
                     self.hw.set_speed(0)
                     self.hw.set_steering(0)
+                    safety.update_yolo()   # keep safety supervisor alive during calibration
                     
                     if elapsed_run > 3.0:
                         try:
@@ -988,12 +1009,63 @@ class Orchestrator:
                     
                     # Keep dashboard updated during calibration
                     self._last_perc = self.vision.process(raw_frame)
+                    push_latest(self._q_bev, _annotate_bev(
+                        self._last_perc, self._last_ctrl))   # BEV live during calibration
                     if self.traffic_engine:
                         self._last_t_res = self.traffic_engine.process(raw_frame, "CONTINUOUS")
                     else:
                         self._last_t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
                         
                     elapsed = time.time()-ts
+
+                    # ── CALIBRATION OVERLAY — pushed to camera panel ─────────────────
+                    calib_vis = raw_frame.copy()
+                    h_vis, w_vis = calib_vis.shape[:2]
+
+                    # Draw vanishing-point candidates accumulated so far
+                    try:
+                        from visual_calibrator import _detect_vanishing_point
+                        vp = _detect_vanishing_point(raw_frame)
+                        if vp is not None:
+                            vx, vy = int(vp[0]), int(vp[1])
+                            cv2.drawMarker(calib_vis, (vx, vy), (0, 255, 255),
+                                           cv2.MARKER_CROSS, 30, 2, cv2.LINE_AA)
+                            cv2.circle(calib_vis, (vx, vy), 12, (0, 255, 255), 2)
+                            _lbl(calib_vis, f"VP ({vx},{vy})", vx+14, vy-8,
+                                 scale=0.5, color=(0,255,255))
+                    except Exception:
+                        pass  # visual_calibrator may not export _detect_vanishing_point
+
+                    # Draw the BEV trapezoid SRC_PTS on the camera frame
+                    src = self.vision.SRC_PTS.astype(np.int32)
+                    cv2.polylines(calib_vis, [src[[0,1,3,2]].reshape(-1,1,2)],
+                                  True, (0, 180, 255), 2, cv2.LINE_AA)
+                    for pt in src:
+                        cv2.circle(calib_vis, tuple(pt), 5, (0,180,255), -1)
+                    _lbl(calib_vis, "BEV TRAPEZOID",
+                         int(src[:,0].mean())-50, int(src[:,1].min())-8,
+                         scale=0.4, color=(0,180,255))
+
+                    # Status bar with VP/HDG candidate counts
+                    n_vp  = len(getattr(calib, '_vp_candidates',  []))
+                    n_hdg = len(getattr(calib, '_heading_candidates', []))
+                    n_frm = len(getattr(calib, '_frames', []))
+                    bar_txt = (f"CALIBRATING  frames={n_frm}  "
+                               f"VP={n_vp}  HDG={n_hdg}  "
+                               f"t={elapsed_run:.1f}s / 3.0s")
+                    cv2.rectangle(calib_vis, (0, 0), (w_vis, 28), (20,20,20), -1)
+                    _lbl(calib_vis, bar_txt, 8, 20, scale=0.45, color=(50,220,220))
+
+                    # Countdown arc (top-right corner)
+                    frac = min(elapsed_run / 3.0, 1.0)
+                    cv2.ellipse(calib_vis, (w_vis-36, 36), (28, 28), -90,
+                                0, int(frac * 360), (0,200,100), 3, cv2.LINE_AA)
+                    _lbl(calib_vis, f"{max(0.0, 3.0-elapsed_run):.1f}s",
+                         w_vis-52, 42, scale=0.40, color=(0,200,100))
+
+                    push_latest(self._q_yolo, calib_vis)
+                    # ── END calibration overlay ───────────────────────────────────────
+
                     time.sleep(max(0.001, FRAME_PERIOD-elapsed))
                     continue
 
@@ -1029,10 +1101,8 @@ class Orchestrator:
                             x0,y0,self._planned_path,self._path_cursor)
                     t_res = self.traffic_engine.process(
                         raw_frame, "DASHED" if ei.get("dotted") else "CONTINUOUS")
-                    safety.update_yolo()
                 else:
                     t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
-                    safety.update_yolo()
                 
                 if self._threaded_yolo and not self._threaded_yolo.is_alive():
                     t_res.speed_multiplier = 0.3
