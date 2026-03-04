@@ -1,11 +1,12 @@
 """
-lane_follower.py — Pure Lane Tracking Pilot (VROOM Method)
+lane_follower.py — Pure Lane Tracking Pilot (VROOM Method) + IMU Yaw Lock
 ===========================================================================
 Stripped down to strictly follow the lane using the robust VROOM pipeline:
 1. Inverse Perspective Mapping (IPM)
 2. HLS Color Isolation + Sobel Edge Detection (Binarization)
 3. Histogram + Sliding Window Tracking
 4. Least-Squares Polynomial Fit & Pure Pursuit Control
+5. IMU Yaw-Lock: Drives perfectly straight for 4s if the right lane is lost.
 """
 
 import cv2
@@ -43,6 +44,18 @@ try:
 except ImportError:
     print("WARNING: picamera2 not found - camera disabled")
 
+# ---------------------------------------------------------------------------
+# IMU - graceful fallback
+# ---------------------------------------------------------------------------
+try:
+    from bno055_imu import BNO055_IMU
+    _IMU_AVAILABLE = True
+except ImportError:
+    _IMU_AVAILABLE = False
+    print("WARNING: bno055_imu not found - IMU disabled")
+    class BNO055_IMU:
+        def get_yaw(self): return 0.0
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
@@ -71,7 +84,6 @@ SINGLE_EDGE_OFFSET_PX = -40  # Only right edge seen -> push left
 # ===========================================================================
 TARGET_FPS    = 30
 FRAME_PERIOD  = 1.0 / TARGET_FPS
-LOST_GRACE_FRAMES = 8
 
 
 # ===========================================================================
@@ -333,6 +345,12 @@ class BFMC_Pilot:
             except Exception as e:
                 log.warning(f"Camera init failed: {e}")
 
+        # Instantiate IMU logic
+        self.imu = BNO055_IMU()
+        self.target_yaw_on_loss = 0.0
+        self.is_yaw_locked      = False
+        self.lane_lost_time     = 0.0
+
         self.M     = cv2.getPerspectiveTransform(SRC_PTS, DST_PTS)
 
         self.tracker = HybridLaneTracker(img_shape=(480, 640))
@@ -342,7 +360,6 @@ class BFMC_Pilot:
         self.smooth_guard  = 0.0
         self.prev_steer    = 0.0   
         self.last_target   = 320.0 + RIGHT_LANE_OFFSET_PX
-        self.lost_frames   = 0
 
         self._fps_t = time.time()
         self._fps   = 0.0
@@ -359,20 +376,13 @@ class BFMC_Pilot:
         Fuses HLS Color Masking (for bright white tape) with Sobel Edge Detection 
         (for sharp lane boundaries). Completely immune to shadows and track seams.
         """
-        # 1. Warp to Bird's Eye View
         warped_colour = cv2.warpPerspective(frame, self.M, (640, 480), flags=cv2.INTER_LINEAR)
-
-        # 2. Convert to HLS (Hue, Lightness, Saturation)
         hls = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2HLS)
-
-        # 3. Color Thresholding: Isolate the White Lane Lines
-        # White tape has high Lightness (>180) and low Saturation (<40)
+        
         lower_white = np.array([0, 180, 0], dtype=np.uint8)
         upper_white = np.array([255, 255, 60], dtype=np.uint8)
         white_mask = cv2.inRange(hls, lower_white, upper_white)
 
-        # 4. Edge Detection (Sobel X)
-        # Finds steep vertical gradients (lane boundaries)
         gray = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2GRAY)
         sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
         abs_sobelx = np.absolute(sobelx)
@@ -381,7 +391,6 @@ class BFMC_Pilot:
         edge_mask = np.zeros_like(scaled_sobel)
         edge_mask[(scaled_sobel >= 40) & (scaled_sobel <= 255)] = 255
 
-        # 5. Combine and clean noise
         combined_binary = cv2.bitwise_or(white_mask, edge_mask)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         cleaned = cv2.morphologyEx(combined_binary, cv2.MORPH_OPEN, kernel)
@@ -445,23 +454,56 @@ class BFMC_Pilot:
                 y_eval = max(0, 480 - eff_la)
 
                 target_x, anchor = self.tracker.get_target_x(y_eval, lane_width_px, total_offset)
+                
+                # Fetch Current IMU Yaw 
+                current_yaw = self.imu.get_yaw()
 
-                lost = target_x is None
-                if lost:
-                    self.lost_frames += 1
-                    target_x = self.last_target
-                else:
-                    self.lost_frames  = 0
+                # Trigger IMU Lock if we completely lose the lane OR specifically lose the right outer edge
+                trigger_imu_lock = (target_x is None) or (sr is None)
+
+                if not trigger_imu_lock:
                     self.last_target  = target_x
+                    self.target_yaw_on_loss = current_yaw  # Constantly save yaw while tracking normally
+                    self.is_yaw_locked = False
+                    self.lane_lost_time = 0.0
 
-                # Steering Math
-                raw_steer = self._pure_pursuit(target_x, eff_la, lane_width_px)
+                    # -----------------------------------------------
+                    # Normal Vision Steering Math
+                    # -----------------------------------------------
+                    raw_steer = self._pure_pursuit(target_x, eff_la, lane_width_px)
+                else:
+                    if target_x is None:
+                        target_x = self.last_target
+                        
+                    if not self.is_yaw_locked:
+                        self.is_yaw_locked = True
+                        self.lane_lost_time = time.time()
+                        
+                    time_lost = time.time() - self.lane_lost_time
+                    
+                    if time_lost <= 4.0:
+                        # -----------------------------------------------
+                        # IMU Yaw-Lock Steering Mode (Active for 4 secs)
+                        # -----------------------------------------------
+                        yaw_err = (self.target_yaw_on_loss - current_yaw + math.pi) % (2 * math.pi) - math.pi
+                        
+                        # P-controller for steering based purely on IMU deviation. 
+                        # *NOTE: If the car steers opposite to correction during a gap, change 1.5 to -1.5*
+                        raw_steer = math.degrees(yaw_err) * 1.5 
+                        
+                        anchor = f"IMU_LOCK ({4.0 - time_lost:.1f}s)"
+                    else:
+                        # Timeout triggered
+                        raw_steer = 0.0
+                        anchor = "LOST_STOP"
 
+                # Apply Steering EMA
                 steer_delta_abs = abs(raw_steer - self.smooth_steer)
                 alpha = self.STEER_EMA_FAST if steer_delta_abs > 8.0 else self.STEER_EMA_SLOW
                 self.smooth_steer = alpha * raw_steer + (1.0 - alpha) * self.smooth_steer
                 steer_angle = self.smooth_steer
 
+                # Apply Rate Limiter
                 rate_delta = steer_angle - self.prev_steer
                 rate_delta = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, rate_delta))
                 steer_angle    = self.prev_steer + rate_delta
@@ -473,34 +515,38 @@ class BFMC_Pilot:
 
                 raw_steer_guarded, guard_spd, guard_on = self.guard.apply(steer_angle, guard_left, guard_right, y_eval=y_eval)
 
-                if lost:
+                # Disable guard interference while blind
+                if self.is_yaw_locked:
                     self.smooth_guard = 0.0
                     guard_on = False
                 else:
                     guard_delta       = raw_steer_guarded - steer_angle
                     self.smooth_guard = (self.GUARD_EMA * guard_delta + (1.0 - self.GUARD_EMA) * self.smooth_guard)
+                
                 steer_angle = steer_angle + self.smooth_guard
 
                 # Speed Policy
                 curvature = self.tracker.get_curvature(y_eval)
 
-                if self.lost_frames > LOST_GRACE_FRAMES or base_speed == 0:
-                    speed = 0.0
-                elif curvature > self.HIGH_CURV_THRESH:
-                    speed = base_speed * self.HIGH_CURV_SCALE
-                elif curvature > self.MED_CURV_THRESH:
-                    speed = base_speed * self.MED_CURV_SCALE
-                elif anchor == "DUAL" and abs(steer_angle) < 10:
-                    speed = base_speed * self.DUAL_SPEED_SCALE
-                elif abs(steer_angle) > 18:
-                    speed = base_speed * 0.60
-                elif abs(steer_angle) > 10:
-                    speed = base_speed * 0.80
+                if self.is_yaw_locked:
+                    time_lost = time.time() - self.lane_lost_time
+                    if time_lost > 4.0 or base_speed == 0:
+                        speed = 0.0
+                    else:
+                        speed = base_speed * 0.75  # Coast at safe speed while driving blind
                 else:
-                    speed = float(base_speed)
-
-                if 0 < self.lost_frames <= LOST_GRACE_FRAMES:
-                    speed *= max(0.3, 1.0 - self.lost_frames / LOST_GRACE_FRAMES)
+                    if curvature > self.HIGH_CURV_THRESH:
+                        speed = base_speed * self.HIGH_CURV_SCALE
+                    elif curvature > self.MED_CURV_THRESH:
+                        speed = base_speed * self.MED_CURV_SCALE
+                    elif anchor == "DUAL" and abs(steer_angle) < 10:
+                        speed = base_speed * self.DUAL_SPEED_SCALE
+                    elif abs(steer_angle) > 18:
+                        speed = base_speed * 0.60
+                    elif abs(steer_angle) > 10:
+                        speed = base_speed * 0.80
+                    else:
+                        speed = float(base_speed)
 
                 if guard_on:
                     speed *= guard_spd
