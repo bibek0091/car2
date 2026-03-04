@@ -163,7 +163,7 @@ class Controller:
         curvature = perc_res.curvature
 
         if abs(map_curvature) > 0.001:
-            max_speed = min(base_speed, math.sqrt(1.2 / abs(map_curvature)))
+            max_speed = base_speed / (1 + abs(map_curvature) * 25.0)
         else:
             max_speed = base_speed
 
@@ -174,8 +174,8 @@ class Controller:
             map_curvature=map_curvature)
 
         # ── 2. Hardware Rate Limiting ──────────────────────────────────────────
-        rate_delta  = max(-self.MAX_STEER_RATE,
-                          min(self.MAX_STEER_RATE, raw_steer - self.prev_steer))
+        rate_delta  = max(-4.0,
+                          min(4.0, raw_steer - self.prev_steer))
         steer_angle = self.prev_steer + rate_delta
         self.prev_steer = steer_angle
 

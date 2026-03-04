@@ -72,8 +72,8 @@ class HardwareIO:
         self._encoder_fail_count = 0
         self._ENCODER_FAIL_LIMIT = 30
 
-        # ── Thread-safe frame queue (maxsize=1 → always freshest frame) ───────
-        self._frame_queue = queue.Queue(maxsize=1)
+        # ── Thread-safe frame queue (maxsize=3 → buffer frames to prevent watchdog false-fires) ───────
+        self._frame_queue = queue.Queue(maxsize=3)
         self._running     = True
 
         # ── STM32 init ────────────────────────────────────────────────────────

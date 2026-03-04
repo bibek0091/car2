@@ -21,14 +21,18 @@ class SafetySupervisor:
 
     def should_stop(self):
         now = time.time()
-        if now - self.yolo_last > 2.0:       # was 0.5s — YOLO runs in background thread
-            return True
-        if now - self.camera_last > 1.5:
-            return True
-        if now - self.serial_last > 0.5:
-            return True
-        if now - self.encoder_last > 1.0:    # encoder silent for 1 s — speed sensing lost
-            return True
+        if now - self.yolo_last > 5.0:       # was 2.0s
+            print("SAFETY STOP: yolo timeout")
+            return "yolo timeout"
+        if now - self.camera_last > 3.0:     # was 1.5s
+            print("SAFETY STOP: camera timeout")
+            return "camera timeout"
+        if now - self.serial_last > 2.0:     # was 0.5s
+            print("SAFETY STOP: serial timeout")
+            return "serial timeout"
+        if now - self.encoder_last > 3.0:    # was 1.0s
+            print("SAFETY STOP: encoder timeout")
+            return "encoder timeout"
         return False
 
     def safe_speed_override(self):

@@ -1062,7 +1062,7 @@ class Orchestrator:
                     elif raw_frame.any():
                         safety.update_camera()
                     velocity_ms = self.hw.get_velocity()
-                    safety.update_serial()   # always update — serial health checked separately
+                    safety.update_encoder()  # stamp encoder locally upon reading velocity
                     safety.update_yolo()     # always alive — traffic check handled separately
 
                     if not calibration_done:
@@ -1070,6 +1070,7 @@ class Orchestrator:
                         self._sv_hint.set(calib._result.status_msg)
                         self.hw.set_speed(0)
                         self.hw.set_steering(0)
+                        safety.update_serial()
                         safety.update_yolo()   # keep safety supervisor alive during calibration
 
                         if elapsed_run > 3.0:
@@ -1204,6 +1205,7 @@ class Orchestrator:
                     if self._estop:
                         # Halted — keep motors off, reuse last perception for dashboard
                         self.hw.set_speed(0); self.hw.set_steering(0)
+                        safety.update_serial() # Update serial after setting speed/steering
                         perc = self._last_perc if self._last_perc else self.vision.process(raw_frame)
                         ctrl = self._last_ctrl
 
@@ -1288,6 +1290,7 @@ class Orchestrator:
                                 self._nav_state = f"JUNCTION_{action}"
                             else: self._nav_state="JUNCTION_STRAIGHT"
 
+                        imu_yaw = imu.read_yaw()
                         self.localizer.update(
                             velocity_ms=velocity_ms, dt=dt,
                             camera_heading_rad=perc.heading_rad,
@@ -1296,14 +1299,9 @@ class Orchestrator:
                             path=self._planned_path,
                             optical_yaw_rate=perc.optical_yaw_rate,
                             optical_vel=perc.optical_vel,
-                            current_steer_rad=math.radians(getattr(self._last_ctrl,'steer_angle_deg',0.0)))
+                            current_steer_rad=math.radians(getattr(self._last_ctrl,'steer_angle_deg',0.0)),
+                            imu_yaw=imu_yaw)
                         self._path_cursor = self.localizer.path_cursor
-
-                        # IMU correction runs AFTER dead-reckoning, not before.
-                        # This way IMU corrects the result of all layers, not just
-                        # the opening state that Layers 1-4 then override.
-                        imu_yaw = imu.read_yaw()
-                        self.localizer.update_imu_yaw(imu_yaw)
 
                         self.localizer.get_upcoming_curve_from_path(
                             self._planned_path,self._path_cursor,velocity_ms)
@@ -1333,15 +1331,15 @@ class Orchestrator:
                                     f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
                                     (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
 
-                        safety.update_encoder()   # stamp encoder liveness each pilot frame
                         ctrl.speed_pwm *= safety.safe_speed_override()
-
+                        safety.update_encoder() # Update encoder after speed calculation
                         self._last_ctrl = ctrl
 
                         # Both lanes lost: count toward E-STOP
                         _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
                         if _ll >= _LLS:
                             self.hw.set_speed(0); self.hw.set_steering(0)
+                            safety.update_serial()
                             self._estop = True
                         else:
                             speed = ctrl.speed_pwm
@@ -1385,6 +1383,7 @@ class Orchestrator:
                                     self._speed_ema = PWM_DEADBAND
 
                             self.hw.set_speed(self._speed_ema); self.hw.set_steering(ctrl.steer_angle_deg)
+                            safety.update_serial()
 
                     # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
                     yolo_frame = t_res.yolo_debug_frame if (t_res is not None and getattr(t_res, 'yolo_debug_frame', None) is not None) else raw_frame
@@ -1438,6 +1437,7 @@ class Orchestrator:
 
         log.info("Pilot loop exited")
         self.hw.set_speed(0); self.hw.set_steering(0)
+        safety.update_serial()
 
 
     def _start_pilot(self):

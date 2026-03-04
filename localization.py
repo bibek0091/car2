@@ -174,11 +174,7 @@ class LocalizationEngine:
             self._snap_miss_frames = 0
         log.info("Path cursor reset.")
 
-    def update_imu_yaw(self, imu_yaw: float):
-        with self._lock:
-            yaw_error = imu_yaw - self.yaw
-            yaw_error = (yaw_error + math.pi) % (2 * math.pi) - math.pi
-            self.yaw += 0.2 * yaw_error
+    # Note: `update_imu_yaw` removed; fused natively inside `update` now
 
     def get_pose(self):
         with self._lock:
@@ -328,7 +324,8 @@ class LocalizationEngine:
                path=None,
                optical_yaw_rate:   float = 0.0,
                optical_vel:        float = 0.0,
-               current_steer_rad:  float = 0.0):
+               current_steer_rad:  float = 0.0,
+               imu_yaw:            float = 0.0):
         """
         Update pose for one time step.
 
@@ -366,41 +363,15 @@ class LocalizationEngine:
                 self._update_cursor_internal(path)
             cursor = self._path_cursor
 
-            # ── Layer 1: Camera Yaw-Rate Integration (LOC-A + LOC-B) ──────────────
-            # LOC-A: gate on heading_conf > 0.35 to reject noisy single-line frames
-            if heading_conf > 0.35 and camera_confidence > 0.3:
-                if self._prev_cam_heading is not None:
-                    raw_yaw_rate = (camera_heading_rad - self._prev_cam_heading) / max(dt, 0.001)
-                else:
-                    raw_yaw_rate = 0.0
-                self._prev_cam_heading = camera_heading_rad
+            # ── Layer 1: IMU Yaw Fusion + Camera Correction ──────────────
+            yaw_error = imu_yaw - self.yaw
+            yaw_error = (yaw_error + math.pi) % (2 * math.pi) - math.pi
+            self.yaw += 0.2 * yaw_error
 
-                # LOC-B: dual-rate EMA — fast on turns, slow on straights
-                alpha = 0.30 if abs(raw_yaw_rate) > 0.3 else 0.12
-                self._cam_yaw_smoothed = (alpha * raw_yaw_rate
-                                          + (1.0 - alpha) * self._cam_yaw_smoothed)
-                # Integrate bounded angular rate (LOC-A)
-                yaw_delta = float(np.clip(
-                    -self._cam_yaw_smoothed * dt,   # NEGATED: cam frame is CW, world is CCW
-                    -self._MAX_CAM_YAW_CORRECTION,
-                     self._MAX_CAM_YAW_CORRECTION))
-                self.yaw += yaw_delta
-
-                # Soft absolute correction for drift (LOC-C)
-                abs_corr = float(np.clip(-camera_heading_rad * self._ABS_HEADING_GAIN,  # NEGATED
-                                         -self._ABS_HEADING_MAX_CORR,
-                                          self._ABS_HEADING_MAX_CORR))
-                self.yaw += abs_corr
-                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
-
-                if heading_conf > 0.4:
-                    cam_error = camera_heading_rad - self.yaw
-                    cam_error = (cam_error + math.pi) % (2 * math.pi) - math.pi
-                    self.yaw += 0.05 * cam_error
-
-            else:
-                self._prev_cam_heading = None   # reset on low-confidence frames
-                self.visual_yaw_rate   = 0.0
+            if heading_conf > 0.4:
+                cam_error = camera_heading_rad - self.yaw
+                cam_error = (cam_error + math.pi) % (2 * math.pi) - math.pi
+                self.yaw += 0.05 * cam_error
 
             # ── Layer 2: A* Path Heading Nudge (drift corrector) ──────────────────
             # Only active when camera is uncertain — prevents over-riding good vision.
